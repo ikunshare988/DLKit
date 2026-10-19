@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "rules": [
+    { "from": "https://huggingface.co/", "to": "https://hf-mirror.com/" },
+    { "from": "https://registry.npmjs.org/", "to": "https://registry.npmmirror.com/" }
+  ]
+}

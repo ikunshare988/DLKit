@@ -15,6 +15,7 @@
 /config/aria2.session
 /config/openlist.json
 /config/ui.json
+/config/mirrors.json
 /config/cacert.pem
 
 # 早期 Python 实现（已由 Rust 版本取代）
