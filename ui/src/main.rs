@@ -904,7 +904,7 @@ impl eframe::App for App {
                                     .color(SECONDARY),
                             );
                             ui.label(
-                                RichText::new("支持直链 / 磁力 / 媒体站 / OpenList")
+                                RichText::new("支持直链 / 下载页解析 / 磁力 / 媒体站 / OpenList")
                                     .size(11.5)
                                     .color(MUTED),
                             );
