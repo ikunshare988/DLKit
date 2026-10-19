@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -730,48 +730,108 @@ fn fetch_chunk(
 // Range 探测返回的总字节数与主源一致，才允许参与下载，避免拼出坏文件。
 
 pub struct Sources {
-    list: Vec<String>,
+    /// 0 号始终是主源；镜像校验通过后由后台线程填入对应槽位，空槽表示还没就绪
+    list: Mutex<Vec<Option<String>>>,
     bad: Vec<AtomicBool>,
     /// 明显慢于最快源的镜像：不再分配新分块（in-flight 的也会被中止）
     slow: Vec<AtomicBool>,
     /// 每个源已写入的字节数，用于算各源实时吞吐
     bytes: Vec<AtomicU64>,
+    /// 正在下载的分块数
+    inflight: Vec<AtomicUsize>,
+    /// 已经成功交付过分块的镜像，之后不受试用额度限制
+    proven: Vec<AtomicBool>,
 }
 
 impl Sources {
-    fn new(list: Vec<String>) -> Sources {
+    fn new(primary: String, extra_slots: usize) -> Sources {
+        let mut list = vec![None; extra_slots + 1];
+        list[0] = Some(primary);
         let bad = list.iter().map(|_| AtomicBool::new(false)).collect();
         let slow = list.iter().map(|_| AtomicBool::new(false)).collect();
         let bytes = list.iter().map(|_| AtomicU64::new(0)).collect();
+        let inflight = list.iter().map(|_| AtomicUsize::new(0)).collect();
+        let mut proven = list.iter().map(|_| AtomicBool::new(false)).collect::<Vec<_>>();
+        proven[0] = AtomicBool::new(true);
         Sources {
-            list,
+            list: Mutex::new(list),
             bad,
             slow,
             bytes,
+            inflight,
+            proven,
         }
     }
 
-    /// 按分块序号做起始轮换，重试时顺延；跳过失败和过慢的源
-    fn pick(&self, lane: usize, attempt: u32) -> Option<(usize, &str)> {
-        let n = self.list.len();
+    /// 后台校验通过后把镜像放进预留槽位
+    fn set_url(&self, i: usize, url: String) {
+        if let Some(slot) = self.list.lock().unwrap().get_mut(i) {
+            *slot = Some(url);
+        }
+    }
+
+    /// 已就绪的源数量（含主源）
+    fn ready(&self) -> usize {
+        self.list.lock().unwrap().iter().filter(|s| s.is_some()).count()
+    }
+
+    /// 按分块序号做起始轮换，重试时顺延；跳过失败、过慢和未就绪的源。
+    /// 未验证过吞吐的镜像最多同时占 1 块：即使它卡住，也只影响这一块。
+    fn pick(&self, lane: usize, attempt: u32) -> Option<(usize, String)> {
+        const PROBATION: usize = 1;
+        let list = self.list.lock().unwrap();
+        let n = list.len();
         if n == 0 {
             return None;
         }
         let start = (lane + attempt as usize) % n;
-        // 第一轮同时排除 slow；全都 slow 时再放宽，避免无源可用
-        for skip_slow in [true, false] {
+        // pass 0：正常挑选；pass 1：允许过慢的源；pass 2：忽略试用额度
+        for pass in 0..3 {
             for k in 0..n {
                 let i = (start + k) % n;
                 if self.bad[i].load(Ordering::Relaxed) {
                     continue;
                 }
-                if skip_slow && self.slow[i].load(Ordering::Relaxed) {
+                if pass == 0 && self.slow[i].load(Ordering::Relaxed) {
                     continue;
                 }
-                return Some((i, self.list[i].as_str()));
+                if pass < 2
+                    && !self.proven[i].load(Ordering::Relaxed)
+                    && self.inflight[i].load(Ordering::Relaxed) >= PROBATION
+                {
+                    continue;
+                }
+                if let Some(u) = &list[i] {
+                    return Some((i, u.clone()));
+                }
             }
         }
         None
+    }
+
+    fn begin(&self, i: usize) {
+        if let Some(c) = self.inflight.get(i) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn end(&self, i: usize) {
+        if let Some(c) = self.inflight.get(i) {
+            c.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn prove(&self, i: usize) {
+        if let Some(f) = self.proven.get(i) {
+            f.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn busy(&self, i: usize) -> bool {
+        self.inflight
+            .get(i)
+            .map(|c| c.load(Ordering::Relaxed) > 0)
+            .unwrap_or(false)
     }
 
     fn mark_bad(&self, i: usize) {
@@ -801,8 +861,9 @@ impl Sources {
         self.bytes.iter().map(|c| c.load(Ordering::Relaxed)).collect()
     }
 
-    fn len(&self) -> usize {
-        self.list.len()
+    /// 每个槽位是否已经有可用地址
+    fn ready_flags(&self) -> Vec<bool> {
+        self.list.lock().unwrap().iter().map(|s| s.is_some()).collect()
     }
 }
 
@@ -812,18 +873,10 @@ struct MirrorRules {
 }
 
 fn mirror_rules() -> MirrorRules {
-    // 默认只放官方性质的镜像；第三方 GitHub 代理需要用户自己加到
-    // config/mirrors.json，避免在不知情的情况下把流量交给第三方。
-    let mut rules: Vec<(String, String)> = vec![
-        (
-            "https://huggingface.co/".into(),
-            "https://hf-mirror.com/".into(),
-        ),
-        (
-            "https://registry.npmjs.org/".into(),
-            "https://registry.npmmirror.com/".into(),
-        ),
-    ];
+    // 默认不带任何镜像规则：镜像是否更快取决于用户所在网络，
+    // 写死规则可能反而把下载变慢。需要的用户把 config/mirrors.example.json
+    // 复制成 config/mirrors.json 再按需修改。
+    let mut rules: Vec<(String, String)> = Vec::new();
     let mut enabled = true;
     let path = find_root().join("config").join("mirrors.json");
     if let Ok(text) = fs::read_to_string(&path) {
@@ -870,62 +923,69 @@ fn mirror_candidates(url: &str) -> Vec<String> {
     out
 }
 
-/// 校验镜像：Range 取 2 字节，必须返回 206 且总长度与主源一致。
-/// 只等 4 秒，慢的镜像直接放弃，不为它拖慢整体启动。
-fn verify_mirrors(primary: &str, size: u64, headers: &BTreeMap<String, String>) -> Vec<String> {
-    let cands = mirror_candidates(primary);
-    if cands.is_empty() || size == 0 {
-        return Vec::new();
+/// 校验单个镜像：Range 取开头 1KB，必须返回 206、总长度与主源一致，
+/// 并且开头字节也要一致（同长度不同内容的文件不能混进来）。
+fn verify_mirror(
+    url: &str,
+    size: u64,
+    headers: &BTreeMap<String, String>,
+    head_bytes: &Arc<Mutex<Vec<u8>>>,
+) -> bool {
+    let hdr = std::env::temp_dir().join(format!(
+        ".dlkit-mirror-{}-{}.hdr",
+        std::process::id(),
+        task_seq()
+    ));
+    let mut a: Vec<String> = vec![
+        "-sS".into(), "-L".into(), "--http1.1".into(),
+        "-o".into(), "-".into(),
+        "-D".into(), hdr.to_string_lossy().to_string(),
+        "-r".into(), "0-1023".into(),
+        "--connect-timeout".into(), "3".into(),
+        // 镜像必须很快给出响应：慢到 2 秒还没拿到 1KB 的镜像，
+        // 参与进来只会拖慢整体，不如直接不用
+        "--max-time".into(), "2".into(),
+    ];
+    a.extend(header_args(headers));
+    a.push(url.to_string());
+    let result = match curl_bytes(&a) {
+        Ok((body, _, _)) => {
+            let text = fs::read_to_string(&hdr).unwrap_or_default();
+            let (status, hdrs) = parse_response(&text);
+            let total_ok = hdrs
+                .get("content-range")
+                .and_then(|v| v.rsplit('/').next())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|t| t == size)
+                .unwrap_or(false);
+            status == Some(206) && total_ok && head_matches(&body, head_bytes, size)
+        }
+        Err(_) => false,
+    };
+    let _ = fs::remove_file(&hdr);
+    result
+}
+
+/// 比对镜像返回的开头字节与主源已经落盘的开头字节。
+/// 主源还没写够时最多等 2 秒；等不到就退化为只比长度。
+fn head_matches(body: &[u8], head_bytes: &Arc<Mutex<Vec<u8>>>, size: u64) -> bool {
+    let want = (body.len() as u64).min(size) as usize;
+    if want == 0 {
+        return false;
     }
-    let (tx, rx) = std::sync::mpsc::channel();
-    for url in cands {
-        let headers = headers.clone();
-        let tx = tx.clone();
-        thread::spawn(move || {
-            let mut a: Vec<String> = vec![
-                "-sS".into(), "-L".into(), "--http1.1".into(),
-                "-o".into(), "NUL".into(),
-                "-D".into(), "-".into(),
-                "-r".into(), "0-1".into(),
-                "--connect-timeout".into(), "5".into(),
-                "--max-time".into(), "8".into(),
-            ];
-            a.extend(header_args(&headers));
-            a.push(url.clone());
-            let ok = match curl(&a) {
-                Ok((out, _, _)) => {
-                    let (status, hdrs) = parse_response(&out);
-                    let total_ok = hdrs
-                        .get("content-range")
-                        .and_then(|v| v.rsplit('/').next())
-                        .and_then(|s| s.trim().parse::<u64>().ok())
-                        .map(|t| t == size)
-                        .unwrap_or(false);
-                    status == Some(206) && total_ok
-                }
-                Err(_) => false,
-            };
-            let _ = tx.send((url, ok));
-        });
-    }
-    drop(tx);
-    let deadline = Instant::now() + Duration::from_secs(4);
-    let mut good = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break;
-        }
-        match rx.recv_timeout(left) {
-            Ok((url, ok)) => {
-                if ok {
-                    good.push(url);
-                }
+        {
+            let got = head_bytes.lock().unwrap();
+            if got.len() >= want {
+                return got[..want] == body[..want];
             }
-            Err(_) => break,
         }
+        if Instant::now() >= deadline {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
     }
-    good
 }
 
 // ---------------- 快速启动：探测与首块并行 ----------------
@@ -1119,6 +1179,8 @@ pub fn run_fast(
     let limit = Arc::new(AtomicU64::new(u64::MAX));
     let stop = Arc::new(AtomicBool::new(false));
     let io = Arc::new(IoStats::default());
+    // 主源开头 1KB：镜像校验时用来比对内容，避免同长度不同文件拼在一起
+    let head_bytes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
 
     let writer = {
         let file = file.clone();
@@ -1126,11 +1188,13 @@ pub fn run_fast(
         let limit = limit.clone();
         let stop = stop.clone();
         let io = io.clone();
+        let head_bytes = head_bytes.clone();
         thread::spawn(move || {
             if let Some(so) = child.stdout.take() {
                 let mut reader = std::io::BufReader::with_capacity(1 << 20, so);
                 let mut buf = vec![0u8; 1 << 20];
                 let mut off = 0u64;
+                let mut head: Vec<u8> = Vec::with_capacity(1024);
                 loop {
                     if stop.load(Ordering::SeqCst) {
                         break;
@@ -1141,6 +1205,11 @@ pub fn run_fast(
                             let max = limit.load(Ordering::SeqCst);
                             let take = (n as u64).min(max.saturating_sub(off)) as usize;
                             if take > 0 {
+                                if off < 1024 && head.len() < 1024 {
+                                    let need = (1024 - head.len() as u64).min(take as u64) as usize;
+                                    head.extend_from_slice(&buf[..need]);
+                                    *head_bytes.lock().unwrap() = head.clone();
+                                }
                                 let t = Instant::now();
                                 if file.seek_write(&buf[..take], off).is_err() {
                                     break;
@@ -1237,28 +1306,51 @@ pub fn run_fast(
             .map_err(|e| EngErr::Fatal(format!("预分配磁盘空间失败：{}", e)))?;
     }
 
-    // 镜像校验与首块下载并行：这段时间首块仍在传，不额外占用墙钟时间
-    let mut source_urls = vec![fetch_url.clone()];
-    if size >= 4 << 20 && std::env::var("DLKIT_NO_MIRROR").is_err() {
-        let extra = verify_mirrors(&fetch_url, size, headers);
-        if !extra.is_empty() {
-            log_line(
-                &task,
-                format!("{} 个镜像通过校验，分块将分散下载", extra.len()),
-            );
-            source_urls.extend(extra);
-        }
-    }
-    let sources = Arc::new(Sources::new(source_urls));
+    // 镜像校验放到后台：worker 先用主源开工，校验通过的镜像再逐个加入。
+    let cands = if size >= 4 << 20 && std::env::var("DLKIT_NO_MIRROR").is_err() {
+        mirror_candidates(&fetch_url)
+    } else {
+        Vec::new()
+    };
+    let mirror_pending = !cands.is_empty();
 
     let lanes = ((conn as u64) * 3 / 2).max(1);
+    // 有镜像时把块切小一点：块数够多，后加入的镜像才有活可干，
+    // 否则几个大块一开始就被主源抢完，镜像只能空转。
+    let min_block = if mirror_pending { 1 << 20 } else { 4 << 20 };
     let block = ((size + lanes - 1) / lanes)
-        .clamp(4 << 20, 32 << 20)
+        .clamp(min_block, 32 << 20)
         .min(size.max(1));
     let total_blocks = ((size + block - 1) / block) as usize;
     let first_end = (block - 1).min(size - 1);
-    // 首块交给已经在传的这条连接，剩下的块交给并发 worker
+    // 首块交给已经在传的这条连接，剩下的块交给并发 worker。
+    // 必须在做任何耗时操作之前设好上限，否则这条连接会一路把整个文件读完，
+    // worker 再把同样的区块重下一遍。
     limit.store(first_end + 1, Ordering::SeqCst);
+
+    let sources = Arc::new(Sources::new(fetch_url.clone(), cands.len()));
+    if mirror_pending {
+        let sources_v = sources.clone();
+        let headers_v = headers.clone();
+        let head_v = head_bytes.clone();
+        let task_v = task.clone();
+        thread::spawn(move || {
+            for (i, url) in cands.into_iter().enumerate() {
+                if verify_mirror(&url, size, &headers_v, &head_v) {
+                    sources_v.set_url(i + 1, url.clone());
+                    log_line(
+                        &task_v,
+                        format!(
+                            "镜像已加入：{}（{} 源并行下载）",
+                            host_of(&url).unwrap_or_else(|| url.clone()),
+                            sources_v.ready()
+                        ),
+                    );
+                }
+            }
+        });
+    }
+
     if let Ok(mut t) = task.lock() {
         t.message = format!("{} 路分片下载中…", conn);
     }
@@ -1324,6 +1416,14 @@ pub fn run_fast(
     }
 
     let worker_count = conn.saturating_sub(1).max(1).min(total_blocks.saturating_sub(1).max(1));
+    // 有镜像候选时给校验留一点时间：分块一旦被 worker 抢完，后加入的镜像就没活可干。
+    // 只等 400ms，本地/就近镜像通常来得及；慢镜像迟到也不会拖住整体。
+    if mirror_pending {
+        let deadline = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < deadline && sources.ready() == 1 {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
     let mut handles = Vec::new();
     for wid in 0..worker_count {
         let done = done.clone();
@@ -1376,6 +1476,9 @@ pub fn run_fast(
     let mut last_tune = Instant::now() - Duration::from_secs(5);
     let mut src_snap = sources.snapshot_bytes();
     let mut src_t = Instant::now();
+    let mut src_ready_n = 1usize;
+    let mut src_last = src_snap.clone();
+    let mut stalled: Vec<Option<Instant>> = vec![None; src_last.len()];
     loop {
         let all_workers = handles.iter().all(|h| h.is_finished());
         let boot_done = writer.is_finished();
@@ -1437,19 +1540,58 @@ pub fn run_fast(
                 last_tune = now;
             }
 
-            // 每 3 秒比较各源实际吞吐，明显偏慢的镜像不再分配分块
-            if sources.len() > 1 && now.duration_since(src_t) >= Duration::from_secs(3) {
-                let cur_b = sources.snapshot_bytes();
+            // 每 2 秒比较各源实际吞吐，明显偏慢的镜像不再分配分块。
+            // 后台新加入镜像时重置统计窗口，避免把「加入前的空窗」算成低速度
+            let ready = sources.ready_flags();
+            let ready_n = ready.iter().filter(|r| **r).count();
+            let cur_b = sources.snapshot_bytes();
+            if ready_n != src_ready_n {
+                src_ready_n = ready_n;
+                src_snap = cur_b.clone();
+                src_t = now;
+            }
+            // 卡死检测：有在途分块却 1.5 秒一个字节都没收到，直接弃用，
+            // 不等 2 秒窗口的速度比较（第一次连接可能卡在重定向或建连上）
+            if ready_n > 1 {
+                for i in 1..ready.len() {
+                    if !ready[i] {
+                        stalled[i] = None;
+                        continue;
+                    }
+                    if sources.busy(i) && cur_b[i] == src_last[i] {
+                        match stalled[i] {
+                            Some(t0) if now.duration_since(t0) >= Duration::from_millis(1000) => {
+                                if sources.mark_slow(i) {
+                                    log_line(&task, "镜像长时间没有数据，已弃用".into());
+                                }
+                            }
+                            None => stalled[i] = Some(now),
+                            _ => {}
+                        }
+                    } else {
+                        stalled[i] = None;
+                    }
+                }
+            }
+            src_last = cur_b.clone();
+            if ready_n > 1 && now.duration_since(src_t) >= Duration::from_secs(2) {
                 let dt_s = now.duration_since(src_t).as_secs_f64().max(0.001);
                 let speeds: Vec<f64> = cur_b
                     .iter()
                     .zip(src_snap.iter())
                     .map(|(a, b)| a.saturating_sub(*b) as f64 / 1048576.0 / dt_s)
                     .collect();
-                let fastest = speeds.iter().cloned().fold(0.0f64, f64::max);
+                let fastest = speeds
+                    .iter()
+                    .zip(ready.iter())
+                    .filter(|(_, r)| **r)
+                    .map(|(s, _)| *s)
+                    .fold(0.0f64, f64::max);
                 if fastest >= 0.5 {
                     for i in 1..speeds.len() {
-                        if speeds[i] < fastest * 0.25 && sources.mark_slow(i) {
+                        // 只判断真正在干活的源：刚加入还没分到块的镜像不能算慢
+                        let active = sources.busy(i) || speeds[i] > 0.0;
+                        if ready[i] && active && speeds[i] < fastest * 0.25 && sources.mark_slow(i) {
                             log_line(
                                 &task,
                                 format!(
@@ -1622,7 +1764,7 @@ pub fn run_turbo(
         .map(|t| t.cancel.clone())
         .unwrap_or_else(|_| Arc::new(AtomicBool::new(false)));
     let headers = Arc::new(headers.clone());
-    let sources = Arc::new(Sources::new(vec![url.to_string()]));
+    let sources = Arc::new(Sources::new(url.to_string(), 0));
     let out_dir_arc = Arc::new(out_dir.to_path_buf());
     log_line(
         &task,
@@ -1832,6 +1974,21 @@ fn fetch_block(
                 return false;
             }
         };
+        // 记录该源有一个在途分块（未验证过吞吐的镜像靠这个限制为一次一块）
+        sources.begin(src_idx);
+        if std::env::var("DLKIT_DEBUG_SRC").is_ok() {
+            log_line(
+                task,
+                format!("块 {}-{} 由源 {} 下载（第 {} 次）", off, end, src_idx, attempt),
+            );
+        }
+        struct SrcGuard<'a>(&'a Sources, usize);
+        impl Drop for SrcGuard<'_> {
+            fn drop(&mut self) {
+                self.0.end(self.1);
+            }
+        }
+        let _src_guard = SrcGuard(sources, src_idx);
         let _ = fs::remove_file(hdr_path);
         let mut args: Vec<String> = vec![
             "-sS".into(), "-L".into(), "--http1.1".into(),
@@ -1841,13 +1998,22 @@ fn fetch_block(
             "--connect-timeout".into(), "15".into(),
             // 卡死/极慢的单条连接尽快放弃，交给重试换一条线路，
             // 否则一个卡在几十 KB/s 的分块会把整个任务拖到几十秒。
+            // 镜像本来就有主源兜底，判定可以更激进；主源则宽容一些，
+            // 避免把「站点本身就慢」误判成失败。
             "--speed-limit".into(), "102400".into(),
-            "--speed-time".into(), "10".into(),
-            "--retry".into(), "3".into(), "--retry-delay".into(), "1".into(),
-            "--retry-all-errors".into(),
+            "--speed-time".into(), if src_idx > 0 { "2".into() } else { "10".into() },
             "-D".into(), hdr_path.to_string_lossy().to_string(),
             "-o".into(), "-".into(),
         ];
+        if src_idx == 0 {
+            // 镜像失败由我们自己的重试逻辑换源，不需要 curl 内部重试，
+            // 否则一个卡住的镜像连接会在同一个进程里反复重试，迟迟不返回
+            args.extend([
+                "--retry".into(), "3".into(),
+                "--retry-delay".into(), "1".into(),
+                "--retry-all-errors".into(),
+            ]);
+        }
         args.extend(header_args(headers));
         args.push(src.to_string());
 
@@ -2004,6 +2170,7 @@ fn fetch_block(
 
         // Range 请求只要字节数收齐就是完整数据，不因 curl 退出码/连接收尾方式判失败
         if written == want {
+            sources.prove(src_idx);
             return true;
         }
         if written > 0 {
