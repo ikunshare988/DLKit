@@ -414,6 +414,19 @@ fn scan(shared: &ScanShared, page_url: &str, jar: &Path) -> Result<Vec<Candidate
     if cancelled(shared) {
         return Err("已取消".into());
     }
+    // 有些下载页的表格是 JS 渲染的，静态 HTML 里只剩一个入口文件
+    // （例如 nodejs.org 只剩源码包）。这类目录通常还放着校验和清单，
+    // 清单里完整列着该版本的全部产物，补进来就能看到 .zip / .msi。
+    let file_count = raw
+        .iter()
+        .filter(|r| {
+            let e = ext_of(&r.url);
+            is_file_ext(&e) || is_media_ext(&e)
+        })
+        .count();
+    if file_count > 0 && file_count <= 6 && Instant::now() < deadline {
+        add_manifest_links(shared, &mut raw, jar, deadline);
+    }
     if raw.is_empty() {
         return Ok(Vec::new());
     }
@@ -422,9 +435,112 @@ fn scan(shared: &ScanShared, page_url: &str, jar: &Path) -> Result<Vec<Candidate
     Ok(probe_all(shared, raw, jar, page_url))
 }
 
+/// 发布清单里常见的文件名
+const MANIFEST_NAMES: [&str; 3] = ["SHASUMS256.txt", "SHASUMS.txt", "checksums.txt"];
+const MAX_MANIFEST_FILES: usize = 40;
+
+/// 取链接所在目录（含结尾的 `/`）
+fn dir_of(url: &str) -> Option<String> {
+    let p = url.split(['?', '#']).next().unwrap_or(url);
+    let i = p.rfind('/')?;
+    if i < p.find("//")? + 3 {
+        return None;
+    }
+    Some(p[..i + 1].to_string())
+}
+
+/// 解析「校验和 + 文件名」清单（sha256sum 格式），返回其中的文件名
+fn parse_manifest(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let hash = it.next().unwrap_or("");
+        if hash.len() < 32 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let name = it.last().unwrap_or("").trim_start_matches('*');
+        // 只要同目录下的单个文件；带路径的是解包出来的零散件，噪音太大
+        if name.is_empty() || name.contains('/') || name.contains('\\') {
+            continue;
+        }
+        if ext_of(name).is_empty() {
+            continue;
+        }
+        if !out.iter().any(|x| x == name) {
+            out.push(name.to_string());
+        }
+        if out.len() >= MAX_MANIFEST_FILES {
+            break;
+        }
+    }
+    out
+}
+
+fn add_manifest_links(shared: &ScanShared, raw: &mut Vec<Raw>, jar: &Path, deadline: Instant) {
+    let mut dirs: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for r in raw.iter() {
+        let e = ext_of(&r.url);
+        if !is_file_ext(&e) && !is_media_ext(&e) {
+            continue;
+        }
+        if let Some(d) = dir_of(&r.url) {
+            if seen.insert(d.clone()) && dirs.len() < 3 {
+                dirs.push(d);
+            }
+        }
+    }
+    for dir in dirs {
+        for name in MANIFEST_NAMES {
+            if Instant::now() > deadline || cancelled(shared) {
+                return;
+            }
+            let page = match fetch_page(&format!("{}{}", dir, name), jar) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if page.content_type.contains("html") {
+                continue;
+            }
+            let names = parse_manifest(&page.html);
+            if names.is_empty() {
+                continue;
+            }
+            let mut order = raw.iter().map(|r| r.order).max().unwrap_or(0) + 1;
+            let before = raw.len();
+            for n in names {
+                let u = format!("{}{}", dir, n);
+                if let Some(old) = raw.iter_mut().find(|r| r.url == u) {
+                    // 清单里的文件名才是权威名称，页面上的按钮文字常常是占位符
+                    old.title = n;
+                    continue;
+                }
+                raw.push(Raw {
+                    url: u,
+                    title: n,
+                    page: dir.clone(),
+                    order,
+                });
+                order += 1;
+            }
+            let added = raw.len() - before;
+            if added > 0 {
+                set_msg(
+                    shared,
+                    format!("页面是动态渲染的，从发布清单补充了 {} 个文件", added),
+                );
+            }
+            break;
+        }
+    }
+}
+
 fn short_url(u: &str) -> String {
     let s = u.split(['?', '#']).next().unwrap_or(u);
-    let s = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")).unwrap_or(s);
     if s.chars().count() > 60 {
         format!("{}…", s.chars().take(60).collect::<String>())
     } else {
