@@ -1,0 +1,36 @@
+# 本地依赖（体积很大，不随仓库分发）
+/bin/
+/downloads/
+/data/
+/logs/
+/.bench/
+
+# 构建缓存
+/ui/target/
+# 本地镜像源配置（各人网络环境不同，不强制）
+/ui/.cargo/
+
+# 本机配置（可能含账号密码与本地路径）
+/config/aria2.conf
+/config/aria2.session
+/config/openlist.json
+/config/ui.json
+/config/cacert.pem
+
+# 早期 Python 实现（已由 Rust 版本取代）
+/app/
+/dl.bat
+
+# 编译产物
+*.exe
+*.pdb
+*.dll
+*.lib
+*.exp
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

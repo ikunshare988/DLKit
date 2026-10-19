@@ -1,0 +1,30 @@
+# aria2 配置示例
+# 复制为 config/aria2.conf 后按需修改
+
+# 下载目录
+dir=D:\OSTDownloader\downloads
+
+# 单服务器最大连接数与分片数（aria2 上限 16）
+split=16
+max-connection-per-server=16
+min-split-size=1M
+
+# 不做预分配，避免大文件等待
+file-allocation=none
+
+# 断点续传会话
+input-file=D:\OSTDownloader\config\aria2.session
+save-session=D:\OSTDownloader\config\aria2.session
+
+# HTTPS 证书：吊销检查在部分网络下会失败，可改用 Mozilla CA bundle
+# ca-certificate=D:\OSTDownloader\config\cacert.pem
+check-certificate=true
+
+# RPC（本机使用）
+enable-rpc=true
+rpc-listen-all=false
+rpc-listen-port=6800
+rpc-secret=change-me-to-a-random-string
+
+# 完成后不保留控制文件
+force-save=false
