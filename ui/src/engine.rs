@@ -138,8 +138,11 @@ pub enum EngErr {
 }
 
 pub fn find_root() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        let mut cur = exe.parent().map(|p| p.to_path_buf());
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+    if let Some(start) = exe_dir.clone() {
+        let mut cur = Some(start);
         for _ in 0..6 {
             if let Some(p) = cur.clone() {
                 if p.join("bin").join("aria2").join("aria2c.exe").exists() {
@@ -151,7 +154,10 @@ pub fn find_root() -> PathBuf {
             }
         }
     }
-    PathBuf::from(r"D:\DLKit")
+    // 找不到 bin/（程序包不完整）时退回 exe 所在目录。
+    // 不能写死 D:\DLKit：换一台电脑那台机器上根本没有这个路径，
+    // 之后的 start.ps1、config、downloads 全都会指向不存在的目录。
+    exe_dir.unwrap_or_else(|| PathBuf::from("."))
 }
 
 // ---------------- 链接分类 ----------------
@@ -3757,8 +3763,13 @@ fn aria2_rpc(root: &Path, method: &str, params: Value) -> Result<Value, EngErr> 
         .output()
         .map_err(|e| EngErr::Soft(format!("aria2 RPC 不可用：{}", e)))?;
     let text = String::from_utf8_lossy(&out.stdout).to_string();
-    let v: Value = serde_json::from_str(&text)
-        .map_err(|_| EngErr::Soft("aria2 未运行，请先启动服务".into()))?;
+    let v: Value = serde_json::from_str(&text).map_err(|_| {
+        EngErr::Soft(
+            "aria2 未运行：请确认程序目录下有 bin\\aria2\\aria2c.exe 和 config\\aria2.conf，\
+             再点「启动服务」（BT / 磁力 / aria2 兜底都需要它）"
+                .into(),
+        )
+    })?;
     if let Some(err) = v.get("error") {
         return Err(EngErr::Soft(format!(
             "aria2 错误：{}",

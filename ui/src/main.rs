@@ -187,6 +187,53 @@ impl App {
         app
     }
 
+    /// 启动 aria2 / OpenList：先检查文件是否齐全，缺什么直接说明
+    fn start_services(&mut self) {
+        let script = self.root.join("start.ps1");
+        let aria = self.root.join("bin").join("aria2").join("aria2c.exe");
+        let conf = self.root.join("config").join("aria2.conf");
+        if !script.exists() {
+            self.notify(format!(
+                "找不到 {}：程序包不完整，请把整个目录一起复制",
+                script.display()
+            ));
+            return;
+        }
+        if !aria.exists() {
+            self.notify("缺少 bin\\aria2\\aria2c.exe：请使用完整程序包（含 bin、config、start.ps1）");
+            return;
+        }
+        if !conf.exists() {
+            self.notify("缺少 config\\aria2.conf：复制 aria2.conf.example 后填入路径与 rpc-secret");
+            return;
+        }
+        let log_dir = self.root.join("logs");
+        let _ = std::fs::create_dir_all(&log_dir);
+        let log_path = log_dir.join("start.err.log");
+        let err = std::fs::File::create(&log_path).ok();
+        #[allow(unused_mut)]
+        let mut c = std::process::Command::new("powershell");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x0800_0000);
+        }
+        c.args(["-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"])
+            .arg(&script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null());
+        if let Some(f) = err {
+            c.stderr(f);
+        }
+        match c.spawn() {
+            Ok(_) => self.notify(format!(
+                "正在启动服务…几秒后仍离线请看 {}",
+                log_path.display()
+            )),
+            Err(e) => self.notify(format!("启动失败：{}", e)),
+        }
+    }
+
     /// 托盘事件、关窗拦截、托盘提示刷新
     fn handle_shell(&mut self, ctx: &egui::Context) {
         use egui::ViewportCommand;
@@ -1171,19 +1218,7 @@ impl eframe::App for App {
                             self.selected = 0;
                         }
                         if !self.svc_online && ui.button("启动服务").clicked() {
-                            let script = self.root.join("start.ps1");
-                            #[allow(unused_mut)]
-                            let mut c = std::process::Command::new("powershell");
-                            #[cfg(windows)]
-                            {
-                                use std::os::windows::process::CommandExt;
-                                c.creation_flags(0x0800_0000);
-                            }
-                            let _ = c
-                                .args(["-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"])
-                                .arg(script)
-                                .spawn();
-                            self.notify("正在启动 aria2 / OpenList…");
+                            self.start_services();
                         }
                         let (txt, fg, bg) = if self.svc_online {
                             ("aria2 在线", SUCCESS, SUCCESS_BG)

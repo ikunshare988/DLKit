@@ -1,8 +1,10 @@
 ﻿# aria2 配置示例
 # 复制为 config/aria2.conf 后按需修改
+# 路径都相对于「程序目录」（start.ps1 会把工作目录切到程序目录），
+# 这样整个文件夹换一台电脑、换一个盘符都不用改配置。
 
 # 下载目录
-dir=D:\DLKit\downloads
+dir=downloads
 
 # 单服务器最大连接数与分片数（aria2 上限 16）
 split=16
@@ -13,11 +15,14 @@ min-split-size=1M
 file-allocation=none
 
 # 断点续传会话
-input-file=D:\DLKit\config\aria2.session
-save-session=D:\DLKit\config\aria2.session
+input-file=config/aria2.session
+save-session=config/aria2.session
+
+# 日志（留空则不写日志）
+log=logs/aria2.log
 
 # HTTPS 证书：吊销检查在部分网络下会失败，可改用 Mozilla CA bundle
-# ca-certificate=D:\DLKit\config\cacert.pem
+# ca-certificate=config/cacert.pem
 check-certificate=true
 
 # RPC（本机使用）
