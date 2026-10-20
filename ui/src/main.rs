@@ -4,6 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod engine;
+mod platform;
 mod scanner;
 
 use engine::{Shared, Status, Task};
@@ -126,6 +127,8 @@ struct App {
     svc_online: bool,
     svc_checked: Instant,
     scan: Option<scanner::ScanShared>,
+    /// 用户点过「自己选」后，收起平台推荐横幅
+    scan_hint_hidden: bool,
 }
 
 impl App {
@@ -144,6 +147,7 @@ impl App {
             svc_online: false,
             svc_checked: Instant::now() - Duration::from_secs(10),
             scan: None,
+            scan_hint_hidden: false,
         };
         app
     }
@@ -160,6 +164,7 @@ impl App {
             return;
         }
         self.scan = Some(scanner::start(url));
+        self.scan_hint_hidden = false;
         self.notify("正在解析页面…");
     }
 
@@ -204,6 +209,7 @@ impl App {
             self.tasks.push(t);
         }
         self.selected = self.tasks.len().saturating_sub(n);
+        self.scan_hint_hidden = true;
         self.notify(format!("已加入 {} 个下载任务", n));
     }
 
@@ -213,7 +219,7 @@ impl App {
             Some(s) => s.clone(),
             None => return,
         };
-        let (running, message, error, candidates, pages) = {
+        let (running, message, error, candidates, pages, recommended, recommend_reason) = {
             let st = match shared.lock() {
                 Ok(s) => s,
                 Err(_) => return,
@@ -224,14 +230,18 @@ impl App {
                 st.error.clone(),
                 st.candidates.clone(),
                 st.pages_done,
+                st.recommended,
+                st.recommend_reason.clone(),
             )
         };
+        let hint_hidden = self.scan_hint_hidden;
 
         let mut close = false;
         let mut cancel = false;
         let mut toggles: Vec<(usize, bool)> = Vec::new();
         let mut select_all: Option<bool> = None;
         let mut download_now = false;
+        let mut reveal_all = false;
 
         card_frame().show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -274,6 +284,69 @@ impl App {
             if candidates.is_empty() {
                 return;
             }
+
+            // 平台推荐横幅：解析完成后一次性出现，点「开始下载」直接开，
+            // 点「自己选」收起并恢复全选
+            if let Some(idx) = recommended {
+                if !hint_hidden && !running && error.is_empty() {
+                    if let Some(c) = candidates.get(idx) {
+                        ui.add_space(6.0);
+                        egui::Frame::NONE
+                            .fill(tint(PRIMARY, 20))
+                            .stroke(Stroke::new(1.6, tint(PRIMARY, 210)))
+                            .corner_radius(CornerRadius::same(14))
+                            .inner_margin(Margin::symmetric(12, 10))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    pill(ui, "已按本机选中", PRIMARY, tint(PRIMARY, 52));
+                                    ui.label(
+                                        RichText::new(&recommend_reason)
+                                            .size(11.0)
+                                            .color(SECONDARY),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let btn = egui::Button::new(
+                                                RichText::new("开始下载")
+                                                    .size(12.5)
+                                                    .color(Color32::WHITE),
+                                            )
+                                            .fill(PRIMARY)
+                                            .corner_radius(CornerRadius::same(13));
+                                            if ui.add(btn).clicked() {
+                                                download_now = true;
+                                            }
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new("自己选")
+                                                            .size(12.5)
+                                                            .color(PRIMARY),
+                                                    )
+                                                    .fill(Color32::TRANSPARENT)
+                                                    .corner_radius(CornerRadius::same(13)),
+                                                )
+                                                .clicked()
+                                            {
+                                                reveal_all = true;
+                                            }
+                                        },
+                                    );
+                                });
+                                ui.add_space(2.0);
+                                let detail = if c.size > 0 {
+                                    format!("{}  ·  {}", c.title, fmt_size(c.size))
+                                } else {
+                                    c.title.clone()
+                                };
+                                ui.label(RichText::new(detail).size(14.0).strong().color(TEXT));
+                            });
+                        ui.add_space(6.0);
+                    }
+                }
+            }
+
             ui.add_space(6.0);
             let checked_n = candidates.iter().filter(|c| c.checked).count();
             ui.horizontal(|ui| {
@@ -305,6 +378,9 @@ impl App {
                                 toggles.push((i, checked));
                             }
                             ui.label(RichText::new(&c.title).size(12.5).color(TEXT));
+                            if Some(i) == recommended {
+                                pill(ui, "推荐", SUCCESS, SUCCESS_BG);
+                            }
                             pill(ui, &c.type_label, SECONDARY, PANEL);
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -330,6 +406,11 @@ impl App {
                 });
         });
 
+        if reveal_all {
+            // 收起横幅，并把列表恢复成默认全选，让用户自己调整
+            self.scan_hint_hidden = true;
+            select_all = Some(true);
+        }
         if let Ok(mut st) = shared.lock() {
             for (i, v) in toggles {
                 if let Some(c) = st.candidates.get_mut(i) {
@@ -1152,7 +1233,7 @@ fn headless_scan() -> i32 {
     let mut last = String::new();
     loop {
         std::thread::sleep(Duration::from_millis(250));
-        let (running, msg, error, candidates) = {
+        let (running, msg, error, candidates, recommended) = {
             let s = match st.lock() {
                 Ok(s) => s,
                 Err(_) => return 1,
@@ -1162,6 +1243,7 @@ fn headless_scan() -> i32 {
                 s.message.clone(),
                 s.error.clone(),
                 s.candidates.clone(),
+                s.recommended,
             )
         };
         if msg != last {
@@ -1191,11 +1273,12 @@ fn headless_scan() -> i32 {
                 format!("  [{}]", c.note)
             };
             println!(
-                "{:>3}. [{}] {:>9}  {}{}\n     {}",
+                "{:>3}. [{}] {:>9}  {}{}{}\n     {}",
                 i + 1,
                 c.type_label,
                 size,
                 c.title,
+                if Some(i) == recommended { "  ★推荐" } else { "" },
                 note,
                 c.url
             );

@@ -51,6 +51,12 @@ pub struct ScanState {
     /// 抓页面时得到的 Cookie / Referer，下载时一并带上
     pub headers: BTreeMap<String, String>,
     pub cancel: Arc<AtomicBool>,
+    /// 按本机平台自动选中的候选下标
+    pub recommended: Option<usize>,
+    /// 推荐原因，例如「检测到 Windows 64 位，已排除 2 个其他平台的安装包」
+    pub recommend_reason: String,
+    /// 被排除的其他平台候选数量
+    pub filtered_out: usize,
 }
 
 pub type ScanShared = Arc<Mutex<ScanState>>;
@@ -64,6 +70,9 @@ pub fn start(page_url: String) -> ScanShared {
         error: String::new(),
         headers: BTreeMap::new(),
         cancel: Arc::new(AtomicBool::new(false)),
+        recommended: None,
+        recommend_reason: String::new(),
+        filtered_out: 0,
     }));
     let s = shared.clone();
     thread::spawn(move || run(s, page_url));
@@ -105,8 +114,41 @@ fn run(shared: ScanShared, page_url: String) {
                 if list.is_empty() && st.error.is_empty() {
                     st.error = "页面里没有找到可直接下载的文件（可能是 JS 动态加载，或需要登录）".into();
                 }
+                // 按本机平台挑一个最匹配的：只有在同页混有多个平台版本时才生效，
+                // 资源列表页（整页 mp3、图片）不会被筛选
+                let picked = {
+                    let pairs: Vec<(&str, &str)> = list
+                        .iter()
+                        .map(|c| (c.title.as_str(), c.url.as_str()))
+                        .collect();
+                    crate::platform::plan(crate::platform::Target::detect(), &pairs)
+                };
+                if let Some(p) = picked {
+                    let pick = p.pick;
+                    for (i, c) in list.iter_mut().enumerate() {
+                        c.checked = i == pick;
+                    }
+                    st.recommended = Some(pick);
+                    st.filtered_out = p.filtered;
+                    st.recommend_reason = p.reason;
+                }
                 st.candidates = list;
-                st.message = format!("解析完成，共 {} 个可下载文件", st.candidates.len());
+                st.message = if st.recommended.is_some() {
+                    if st.filtered_out > 0 {
+                        format!(
+                            "解析完成，已排除 {} 个其他平台的安装包，留下 {} 个文件",
+                            st.filtered_out,
+                            st.candidates.len()
+                        )
+                    } else {
+                        format!(
+                            "解析完成，共 {} 个文件，已为你选中匹配本机的版本",
+                            st.candidates.len()
+                        )
+                    }
+                } else {
+                    format!("解析完成，共 {} 个可下载文件", st.candidates.len())
+                };
                 let mut h = BTreeMap::new();
                 h.insert("Referer".into(), page_url.clone());
                 if !cookie.is_empty() {
