@@ -119,6 +119,13 @@ downloads/
 - 视频站（B站、YouTube、抖音等）：交给 yt-dlp，音视频用 ffmpeg 合并
 - 网盘：通过 OpenList 取直链（需要自己部署 OpenList 并挂载）
 
+### 后台与更新
+
+- 点窗口的 × 不退出：程序收进系统托盘，正在下载的任务继续跑
+- 托盘图标悬停显示任务数与当前速度；单击恢复主窗口，右键菜单里是「显示主窗口」「退出 DLKit」
+- 启动时自动检查 GitHub Releases，发现新版本会在窗口顶部提示；点「下载并更新」会下载、核对 SHA256、重启替换，也可以选「稍后」
+- 顶部「检查更新」可以手动触发
+
 ### 下载过程
 
 - 同时显示网络速度和磁盘写入速度
@@ -159,6 +166,8 @@ ui/src/main.rs      界面、配置、任务调度
 ui/src/engine.rs    下载引擎（分片、多源、aria2、yt-dlp、OpenList）
 ui/src/scanner.rs   下载页解析（抓页面、提取链接、探测候选）
 ui/src/platform.rs  按本机平台推荐下载项
+ui/src/tray.rs      系统托盘（后台常驻）
+ui/src/update.rs    自动更新（检查、下载、校验、重启替换）
 start.ps1           启动 aria2 与 OpenList
 config/             配置文件与示例
 ```

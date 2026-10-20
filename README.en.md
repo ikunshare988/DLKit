@@ -119,6 +119,13 @@ A rule means: when a URL starts with `from`, also try the same URL with that pre
 - Video sites (Bilibili, YouTube, Douyin and others): handled by yt-dlp, merged with ffmpeg
 - Cloud drives: direct links via OpenList (you host OpenList yourself)
 
+### Background and updates
+
+- Closing the window does not quit: the app stays in the system tray and downloads keep running
+- Hover the tray icon for task count and current speed; click to restore the window, right-click for "Show window" / "Quit DLKit"
+- GitHub Releases are checked on startup; a new version shows a banner with download, SHA256 verification and restart-to-install, or you can pick "Later"
+- The "Check updates" button in the header triggers a manual check
+
 ### While downloading
 
 - Network throughput and disk write speed are shown separately
@@ -155,6 +162,8 @@ ui/src/main.rs      UI, config, task scheduling
 ui/src/engine.rs    download engine (blocks, mirrors, aria2, yt-dlp, OpenList)
 ui/src/scanner.rs   download-page scanning (fetch, extract, probe)
 ui/src/platform.rs  picks the download matching the current OS
+ui/src/tray.rs      system tray (stay in background)
+ui/src/update.rs    auto-update (check, download, verify, restart)
 start.ps1           starts aria2 and OpenList
 config/             configuration files and examples
 ```

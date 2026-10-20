@@ -363,7 +363,7 @@ fn percent_decode(s: &str) -> String {
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 统一入口：GUI 程序启动 curl / yt-dlp / powershell 时不弹黑窗
-fn new_cmd<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+pub(crate) fn new_cmd<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
     #[allow(unused_mut)]
     let mut c = Command::new(program);
     #[cfg(windows)]
@@ -375,7 +375,7 @@ fn new_cmd<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
 }
 
 /// curl 统一加 --ssl-no-revoke：Windows Schannel 吊销服务器不可达时会直接握手失败
-fn curl_command() -> Command {
+pub(crate) fn curl_command() -> Command {
     let mut c = new_cmd("curl");
     c.arg("--ssl-no-revoke");
     c
@@ -760,7 +760,7 @@ fn set_io(task: &Shared, net: f64, disk: f64) {
 }
 
 /// 计算文件的 SHA256（小写十六进制）
-fn sha256_of(path: &Path) -> Option<String> {
+pub(crate) fn sha256_of(path: &Path) -> Option<String> {
     let mut f = File::open(path).ok()?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];

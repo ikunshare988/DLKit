@@ -6,6 +6,8 @@
 mod engine;
 mod platform;
 mod scanner;
+mod tray;
+mod update;
 
 use engine::{Shared, Status, Task};
 use std::path::PathBuf;
@@ -140,12 +142,24 @@ struct App {
     /// 上一次看到的剪贴板内容，用来判断是否是新复制的链接
     clip_last: String,
     clip_at: Instant,
+    /// 托盘图标（创建失败时为 None，此时关窗即退出）
+    tray: Option<tray::Tray>,
+    /// 关闭窗口 = 退出程序（托盘「退出」或更新重启时置位）
+    allow_close: bool,
+    close_sent: bool,
+    tip_at: Instant,
+    updater: update::Updater,
+    /// 上一次看到的更新提示，避免同一个提示反复弹
+    upd_msg: String,
 }
 
 impl App {
     fn new() -> App {
         let cfg = load_config();
         engine::set_speed_limit(cfg.limit);
+        let tray = tray::Tray::new();
+        let updater = update::Updater::new();
+        updater.check();
         let app = App {
             url: String::new(),
             ol_path: String::new(),
@@ -163,8 +177,232 @@ impl App {
             // 启动时已有的剪贴板内容不算「新复制」，避免一打开就自动填入
             clip_last: clipboard_text().unwrap_or_default(),
             clip_at: Instant::now(),
+            tray,
+            allow_close: false,
+            close_sent: false,
+            tip_at: Instant::now(),
+            updater,
+            upd_msg: String::new(),
         };
         app
+    }
+
+    /// 托盘事件、关窗拦截、托盘提示刷新
+    fn handle_shell(&mut self, ctx: &egui::Context) {
+        use egui::ViewportCommand;
+
+        // 隐藏时靠这个定时器继续驱动 logic（每帧 ui 也会各自请求重绘）
+        ctx.request_repaint_after(Duration::from_millis(400));
+
+        let mut action = tray::Action::None;
+        if let Some(t) = &self.tray {
+            action = t.poll();
+        }
+        match action {
+            tray::Action::Show => {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+            tray::Action::Quit => self.allow_close = true,
+            tray::Action::None => {}
+        }
+
+        // 点 X 不退出：收进托盘，下载继续
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+            if self.tray.is_some() {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                self.notify("已隐藏到托盘，下载继续（托盘右键可退出）");
+            } else {
+                self.allow_close = true;
+            }
+        }
+        if self.allow_close && !self.close_sent {
+            self.close_sent = true;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+
+        if self.tip_at.elapsed() >= Duration::from_millis(1500) {
+            self.tip_at = Instant::now();
+            let (n, speed) = self.active_stats();
+            let tip = if n > 0 {
+                format!("DLKit · {} 个任务 · {}", n, fmt_speed(speed))
+            } else {
+                "DLKit · 空闲".to_string()
+            };
+            if let Some(t) = &mut self.tray {
+                t.set_tooltip(tip);
+            }
+        }
+    }
+
+    /// 正在下载/排队的任务数与合计速度
+    fn active_stats(&self) -> (usize, f64) {
+        let mut n = 0usize;
+        let mut speed = 0.0f64;
+        for t in &self.tasks {
+            if let Some(s) = snapshot(t) {
+                if s.status == Status::Running || s.status == Status::Queued {
+                    n += 1;
+                    speed += s.speed;
+                }
+            }
+        }
+        (n, speed)
+    }
+
+    /// 自动更新横幅
+    fn draw_update(&mut self, ui: &mut egui::Ui) {
+        let st = self.updater.state();
+        if st.phase == update::Phase::Idle {
+            if !st.message.is_empty() && st.message != self.upd_msg {
+                self.upd_msg = st.message.clone();
+                self.notify(st.message.clone());
+            }
+            return;
+        }
+        let active = self.active_stats().0;
+
+        let mut download = false;
+        let mut install = false;
+        let mut dismiss = false;
+        let mut retry = false;
+        let mut open = false;
+
+        egui::Frame::NONE
+            .fill(tint(ACCENT, 14))
+            .stroke(Stroke::new(1.2, tint(ACCENT, 120)))
+            .corner_radius(CornerRadius::same(16))
+            .inner_margin(Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    match st.phase {
+                        update::Phase::Checking => {
+                            pill(ui, "检查更新", PRIMARY, tint(PRIMARY, 26));
+                            ui.label(RichText::new(&st.message).size(12.5).color(SECONDARY));
+                        }
+                        update::Phase::Available => {
+                            pill(ui, "新版本", ACCENT, tint(ACCENT, 42));
+                            ui.label(
+                                RichText::new(format!(
+                                    "v{} 可用（当前 v{}）",
+                                    st.latest,
+                                    update::Updater::current()
+                                ))
+                                .size(13.0)
+                                .strong()
+                                .color(TEXT),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let btn = egui::Button::new(
+                                        RichText::new("下载并更新")
+                                            .size(12.5)
+                                            .color(Color32::WHITE),
+                                    )
+                                    .fill(PRIMARY)
+                                    .corner_radius(CornerRadius::same(13));
+                                    if ui.add(btn).clicked() {
+                                        download = true;
+                                    }
+                                    if ui.button("稍后").clicked() {
+                                        dismiss = true;
+                                    }
+                                    let note = if st.notes.is_empty() {
+                                        "在浏览器中打开 Release 页面".to_string()
+                                    } else {
+                                        st.notes.chars().take(400).collect::<String>()
+                                    };
+                                    if ui
+                                        .button("更新说明")
+                                        .on_hover_text(note)
+                                        .clicked()
+                                    {
+                                        open = true;
+                                    }
+                                },
+                            );
+                        }
+                        update::Phase::Downloading => {
+                            pill(ui, "下载中", PRIMARY, tint(PRIMARY, 26));
+                            ui.label(RichText::new(&st.message).size(12.5).color(SECONDARY));
+                        }
+                        update::Phase::Ready => {
+                            pill(ui, "已就绪", SUCCESS, SUCCESS_BG);
+                            ui.label(RichText::new(&st.message).size(12.5).color(SECONDARY));
+                            if active > 0 {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "重启会中断 {} 个任务（进度已保留）",
+                                        active
+                                    ))
+                                    .size(11.0)
+                                    .color(ACCENT),
+                                );
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let btn = egui::Button::new(
+                                        RichText::new("立即重启更新")
+                                            .size(12.5)
+                                            .color(Color32::WHITE),
+                                    )
+                                    .fill(SUCCESS)
+                                    .corner_radius(CornerRadius::same(13));
+                                    if ui.add(btn).clicked() {
+                                        install = true;
+                                    }
+                                    if ui.button("稍后").clicked() {
+                                        dismiss = true;
+                                    }
+                                },
+                            );
+                        }
+                        update::Phase::Error => {
+                            pill(ui, "更新失败", DANGER, DANGER_BG);
+                            ui.label(RichText::new(&st.message).size(12.5).color(DANGER));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("重试").clicked() {
+                                        retry = true;
+                                    }
+                                    if ui.button("关闭").clicked() {
+                                        dismiss = true;
+                                    }
+                                },
+                            );
+                        }
+                        update::Phase::Idle => {}
+                    }
+                });
+                if st.phase == update::Phase::Downloading {
+                    ui.add_space(6.0);
+                    progress_bar(ui, st.progress);
+                }
+            });
+        ui.add_space(8.0);
+
+        if download {
+            self.updater.download();
+        }
+        if retry {
+            self.updater.check();
+        }
+        if dismiss {
+            self.updater.dismiss();
+        }
+        if open {
+            update::open_release_page();
+        }
+        if install {
+            match self.updater.install() {
+                Ok(()) => std::process::exit(0),
+                Err(e) => self.notify(e),
+            }
+        }
     }
 
     /// 解析下载页：把页面里的可下载文件列出来
@@ -851,6 +1089,12 @@ fn pill_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 }
 
 impl eframe::App for App {
+    /// 窗口收进托盘后 `ui` 不再运行，但 `logic` 仍会被定时调用：
+    /// 托盘菜单、关窗拦截和提示刷新都放这里。
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_shell(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx().request_repaint_after(Duration::from_millis(80));
 
@@ -886,6 +1130,12 @@ impl eframe::App for App {
                     );
                     ui.add_space(2.0);
                     ui.label(RichText::new("多功能下载器").size(12.5).color(SECONDARY));
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!("v{}", update::Updater::current()))
+                            .size(11.0)
+                            .color(MUTED),
+                    );
                     ui.add_space(10.0);
                     ui.label(
                         RichText::new(format!("root: {}", self.root.display()))
@@ -894,6 +1144,14 @@ impl eframe::App for App {
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button("检查更新")
+                            .on_hover_text("从 GitHub Releases 检查新版本")
+                            .clicked()
+                        {
+                            self.updater.check();
+                            self.notify("正在检查更新…");
+                        }
                         if ui.button("打开下载目录").clicked() {
                             let _ = std::process::Command::new("explorer")
                                 .arg(&self.cfg.dir)
@@ -1115,6 +1373,7 @@ impl eframe::App for App {
                     .inner_margin(Margin { left: 18, right: 18, top: 10, bottom: 10 }),
             )
             .show(ui, |ui| {
+                self.draw_update(ui);
                 if self.scan.is_some() {
                     self.draw_scan(ui);
                     ui.add_space(10.0);
