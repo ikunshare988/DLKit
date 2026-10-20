@@ -1,6 +1,6 @@
 [package]
 name = "dlkit"
-version = "0.2.0"
+version = "0.21.0"
 edition = "2021"
 description = "DLKit - 多功能下载器"
 license = "MIT"

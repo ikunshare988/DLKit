@@ -180,15 +180,17 @@ cargo build --release
 
 如果拉取依赖很慢，可以按自己的网络环境配置 crates.io 镜像，例如在 `ui/.cargo/config.toml` 里指定 rsproxy。
 
-打 `v*` 标签推送时，`.github/workflows/release.yml` 会自动编译、生成 `SHA256.txt` 并创建 Release。
+打 `v*` 标签推送时，`.github/workflows/release.yml` 会自动编译、生成 `SHA256.txt`、用 Sigstore 无密钥签名产出 `DLKit.exe.bundle`，然后创建 Release。
 
 ## 项目结构
 
 ```
 ui/src/main.rs      界面、配置、任务调度
-ui/src/engine.rs    下载引擎（分片、多源、aria2、yt-dlp、OpenList）
+ui/src/engine.rs    下载引擎（连接池分片、多源、aria2、yt-dlp、OpenList）
 ui/src/scanner.rs   下载页解析（抓页面、提取链接、探测候选）
 ui/src/platform.rs  按本机平台推荐下载项
+ui/src/accounts.rs  账号（B站 Cookie 加密保存、OpenList 凭据）
+ui/src/deps.rs      依赖检测与一键安装
 ui/src/tray.rs      系统托盘（后台常驻）
 ui/src/update.rs    自动更新（检查、下载、校验、重启替换）
 start.ps1           启动 aria2 与 OpenList
@@ -200,7 +202,7 @@ config/             配置文件与示例
 - 只支持 Windows（依赖 Windows 的定位写入、隐藏子进程窗口等接口）
 - 页面解析不执行 JavaScript。纯前端渲染的下载页（例如 VS Code 官网），如果同目录也没有校验和清单，就只能列出 HTML 里直接写出的链接
 - 速度取决于站点对单个 IP 的限制。站点给满单连接带宽、或对总量限速时，多连接不一定比浏览器快
-- 需要登录、验证码或特殊请求头的资源，目前没有在界面里填 Cookie 的入口
+- 需要登录的资源目前只支持在「账号」页配置 B 站 Cookie；其它站点、验证码或特殊请求头还没有填写入口
 - 网盘功能依赖 OpenList 自身支持的网盘类型
 
 ## 免责声明

@@ -176,15 +176,17 @@ cargo build --release
 
 The binary lands at `ui/target/release/dlkit.exe`; copy it to the app folder as `DLKit.exe`.
 
-Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds, writes `SHA256.txt`, and publishes a release.
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds, writes `SHA256.txt`, signs the exe keylessly with Sigstore into `DLKit.exe.bundle`, and publishes a release.
 
 ## Layout
 
 ```
 ui/src/main.rs      UI, config, task scheduling
-ui/src/engine.rs    download engine (blocks, mirrors, aria2, yt-dlp, OpenList)
+ui/src/engine.rs    download engine (pooled blocks, mirrors, aria2, yt-dlp, OpenList)
 ui/src/scanner.rs   download-page scanning (fetch, extract, probe)
 ui/src/platform.rs  picks the download matching the current OS
+ui/src/accounts.rs  accounts (DPAPI-encrypted Bilibili cookie, OpenList credentials)
+ui/src/deps.rs      dependency check and one-click install
 ui/src/tray.rs      system tray (stay in background)
 ui/src/update.rs    auto-update (check, download, verify, restart)
 start.ps1           starts aria2 and OpenList
@@ -196,7 +198,7 @@ config/             configuration files and examples
 - Windows only (uses positioned writes and hidden child-process windows)
 - Page scanning does not execute JavaScript. Purely client-rendered pages (e.g. the VS Code site) only expose links literally present in the HTML, unless the directory has a checksum manifest
 - Speed depends on how the site limits a single IP. If a site already saturates one connection, or throttles by total bytes, more connections may not beat your browser
-- Resources behind a login, captcha or special headers are not supported yet — there is no Cookie input in the UI
+- Login is only supported for Bilibili, through the cookie field on the Accounts page; other sites, captchas and special headers have no input yet
 - Cloud-drive support depends on which providers OpenList supports
 
 ## Disclaimer
