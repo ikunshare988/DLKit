@@ -36,9 +36,11 @@ config/
 downloads/
 ```
 
+缺哪个都可以在「设置 → 依赖」里点「一键安装」，程序会自己下载到 `bin/` 下（aria2 / yt-dlp / ffmpeg），不需要额外装任何运行库。
+
 准备配置：
 
-1. 复制 `config/aria2.conf.example` 为 `config/aria2.conf`，把里面的路径和 `rpc-secret` 改成自己的
+1. 复制 `config/aria2.conf.example` 为 `config/aria2.conf`，把里面的 `rpc-secret` 改成自己的（路径已是相对路径，整个目录换盘符/换电脑都不用改）
 2. 需要网盘时，复制 `config/openlist.json.example` 为 `config/openlist.json` 并填 OpenList 地址与账号
 
 启动：
@@ -124,6 +126,7 @@ downloads/
 
 ### 后台与更新
 
+- 界面分「下载」和「设置」两页：下载页只管链接与任务，并发 / 限速 / 目录 / 引擎和依赖都在设置页
 - 点窗口的 × 不退出：程序收进系统托盘，正在下载的任务继续跑
 - 托盘图标悬停显示任务数与当前速度；单击恢复主窗口，右键菜单里是「显示主窗口」「退出 DLKit」
 - 启动时自动检查 GitHub Releases，发现新版本会在窗口顶部提示；点「下载并更新」会下载、核对 SHA256、重启替换，也可以选「稍后」

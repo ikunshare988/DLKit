@@ -20,7 +20,7 @@ The exe is not code-signed, so Windows SmartScreen may warn on first launch — 
 
 ## Setup
 
-The exe is standalone, but downloads rely on a few command-line tools. Lay them out like this:
+The binary is a single exe, but downloading relies on a few command-line tools. Put them next to it:
 
 ```
 DLKit.exe
@@ -36,9 +36,11 @@ config/
 downloads/
 ```
 
+Anything missing can be installed with one click from Settings → Dependencies; the app downloads aria2 / yt-dlp / ffmpeg into `bin/` itself and needs no extra runtime.
+
 Configuration:
 
-1. Copy `config/aria2.conf.example` to `config/aria2.conf` and adjust paths and `rpc-secret`
+1. Copy `config/aria2.conf.example` to `config/aria2.conf` and set `rpc-secret` (paths are relative, so the folder is portable across drives and machines)
 2. For cloud drives, copy `config/openlist.json.example` to `config/openlist.json` and fill in your OpenList address and account
 
 Start:
@@ -124,6 +126,7 @@ A rule means: when a URL starts with `from`, also try the same URL with that pre
 
 ### Background and updates
 
+- The UI is split into Download and Settings pages: the download page only handles links and tasks
 - Closing the window does not quit: the app stays in the system tray and downloads keep running
 - Hover the tray icon for task count and current speed; click to restore the window, right-click for "Show window" / "Quit DLKit"
 - GitHub Releases are checked on startup; a new version shows a banner with download, SHA256 verification and restart-to-install, or you can pick "Later"

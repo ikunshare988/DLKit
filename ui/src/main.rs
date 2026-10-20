@@ -3,6 +3,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod deps;
 mod engine;
 mod platform;
 mod scanner;
@@ -124,6 +125,12 @@ fn save_config(cfg: &Config) {
     let _ = std::fs::write(config_path(), v.to_string());
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Download,
+    Settings,
+}
+
 struct App {
     url: String,
     ol_path: String,
@@ -137,6 +144,8 @@ struct App {
     svc_online: bool,
     svc_checked: Instant,
     scan: Option<scanner::ScanShared>,
+    page: Page,
+    deps: deps::Installer,
     /// 用户点过「自己选」后，收起平台推荐横幅
     scan_hint_hidden: bool,
     /// 上一次看到的剪贴板内容，用来判断是否是新复制的链接
@@ -151,6 +160,30 @@ struct App {
     updater: update::Updater,
     /// 上一次看到的更新提示，避免同一个提示反复弹
     upd_msg: String,
+}
+
+/// 左侧导航项
+fn nav_item(ui: &mut egui::Ui, label: &str, page: Page, cur: &mut Page) {
+    let selected = *cur == page;
+    let text = RichText::new(label)
+        .size(13.5)
+        .color(if selected { PRIMARY } else { SECONDARY });
+    let btn = egui::Button::new(text)
+        .fill(if selected {
+            tint(PRIMARY, 34)
+        } else {
+            Color32::TRANSPARENT
+        })
+        .stroke(if selected {
+            Stroke::new(1.0, tint(PRIMARY, 90))
+        } else {
+            Stroke::new(0.0, Color32::TRANSPARENT)
+        })
+        .corner_radius(CornerRadius::same(12))
+        .min_size(egui::vec2(ui.available_width(), 32.0));
+    if ui.add(btn).clicked() {
+        *cur = page;
+    }
 }
 
 impl App {
@@ -173,6 +206,8 @@ impl App {
             svc_online: false,
             svc_checked: Instant::now() - Duration::from_secs(10),
             scan: None,
+            page: Page::Download,
+            deps: deps::Installer::new(),
             scan_hint_hidden: false,
             // 启动时已有的剪贴板内容不算「新复制」，避免一打开就自动填入
             clip_last: clipboard_text().unwrap_or_default(),
@@ -232,6 +267,237 @@ impl App {
             )),
             Err(e) => self.notify(format!("启动失败：{}", e)),
         }
+    }
+
+    /// 设置页：下载参数、依赖补齐、更新
+    fn draw_settings(&mut self, ui: &mut egui::Ui) {
+        let st = self.deps.state();
+        let busy = matches!(
+            st.phase,
+            deps::Phase::Downloading | deps::Phase::Extracting
+        );
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                card_frame().show(ui, |ui| {
+                    ui.label(RichText::new("下载").strong().size(15.0).color(TEXT));
+                    ui.add_space(8.0);
+                    egui::Grid::new("set-download")
+                        .num_columns(2)
+                        .spacing([14.0, 10.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("下载目录").size(12.5).color(SECONDARY));
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.dir_text)
+                                        .desired_width(430.0)
+                                        .margin(egui::vec2(6.0, 3.0)),
+                                )
+                                .changed()
+                            {
+                                self.cfg.dir = PathBuf::from(self.dir_text.clone());
+                                save_config(&self.cfg);
+                            }
+                            ui.end_row();
+
+                            ui.label(RichText::new("并发连接").size(12.5).color(SECONDARY));
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut self.cfg.conn)
+                                            .range(1..=64)
+                                            .suffix(" 路"),
+                                    )
+                                    .changed()
+                                {
+                                    save_config(&self.cfg);
+                                }
+                                ui.label(
+                                    RichText::new("同时会多准备 25% 备用连接")
+                                        .size(11.0)
+                                        .color(MUTED),
+                                );
+                            });
+                            ui.end_row();
+
+                            ui.label(RichText::new("全局限速").size(12.5).color(SECONDARY));
+                            ui.horizontal(|ui| {
+                                let resp = ui.add(
+                                    egui::DragValue::new(&mut self.cfg.limit)
+                                        .range(0.0..=100.0)
+                                        .speed(0.5)
+                                        .suffix(" MB/s"),
+                                );
+                                if resp.changed() {
+                                    engine::set_speed_limit(self.cfg.limit);
+                                    save_config(&self.cfg);
+                                }
+                                let _ = resp.on_hover_text("只作用于内置下载引擎");
+                                ui.label(RichText::new("0 = 不限速").size(11.0).color(MUTED));
+                            });
+                            ui.end_row();
+
+                            ui.label(RichText::new("下载引擎").size(12.5).color(SECONDARY));
+                            egui::ComboBox::from_id_salt("engine-setting")
+                                .selected_text(match self.cfg.engine.as_str() {
+                                    "aria2" => "aria2 优先",
+                                    _ => "自动（最快）",
+                                })
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.cfg.engine,
+                                            "auto".to_string(),
+                                            "自动（最快）",
+                                        )
+                                        .clicked()
+                                    {
+                                        save_config(&self.cfg);
+                                    }
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.cfg.engine,
+                                            "aria2".to_string(),
+                                            "aria2 优先",
+                                        )
+                                        .clicked()
+                                    {
+                                        save_config(&self.cfg);
+                                    }
+                                });
+                            ui.end_row();
+                        });
+                });
+
+                ui.add_space(12.0);
+
+                card_frame().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("依赖").strong().size(15.0).color(TEXT));
+                        ui.label(
+                            RichText::new("下载到程序目录；缺什么补什么，补完即可用")
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                    });
+                    ui.add_space(8.0);
+                    for dep in deps::DEPS {
+                        let ok = deps::installed(&self.root, dep);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(dep.name).strong().size(12.5).color(TEXT));
+                            if ok {
+                                pill(ui, "已安装", SUCCESS, SUCCESS_BG);
+                            } else {
+                                pill(
+                                    ui,
+                                    &format!("缺失 · 约 {} MB", dep.size_mb),
+                                    DANGER,
+                                    DANGER_BG,
+                                );
+                            }
+                            ui.label(RichText::new(dep.note).size(11.0).color(MUTED));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if !ok {
+                                        let running = st.key == dep.key && busy;
+                                        let btn = egui::Button::new(
+                                            RichText::new(if running {
+                                                "安装中…"
+                                            } else {
+                                                "一键安装"
+                                            })
+                                            .size(12.0)
+                                            .color(Color32::WHITE),
+                                        )
+                                        .fill(if running { MUTED } else { PRIMARY })
+                                        .corner_radius(CornerRadius::same(12));
+                                        if ui.add_enabled(!busy, btn).clicked() {
+                                            let root = self.root.clone();
+                                            self.deps.start(root, dep);
+                                        }
+                                    } else if dep.key == "aria2" && !self.svc_online {
+                                        if ui.button("启动服务").clicked() {
+                                            self.start_services();
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                        if st.key == dep.key {
+                            match st.phase {
+                                deps::Phase::Downloading | deps::Phase::Extracting => {
+                                    ui.add_space(4.0);
+                                    progress_bar(ui, st.progress);
+                                    ui.label(
+                                        RichText::new(&st.message).size(11.0).color(SECONDARY),
+                                    );
+                                }
+                                deps::Phase::Error => {
+                                    ui.label(RichText::new(&st.message).size(11.0).color(DANGER));
+                                }
+                                deps::Phase::Done => {
+                                    ui.label(RichText::new(&st.message).size(11.0).color(SUCCESS));
+                                }
+                                deps::Phase::Idle => {}
+                            }
+                        }
+                        ui.add_space(6.0);
+                    }
+                });
+
+                ui.add_space(12.0);
+
+                card_frame().show(ui, |ui| {
+                    ui.label(RichText::new("更新").strong().size(15.0).color(TEXT));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("当前版本 v{}", update::Updater::current()))
+                                .size(12.5)
+                                .color(TEXT),
+                        );
+                        if ui.button("检查更新").clicked() {
+                            self.updater.check();
+                            self.notify("正在检查更新…");
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.hyperlink_to("GitHub 仓库", "https://github.com/ikunshare988/DLKit");
+                        });
+                    });
+                    let us = self.updater.state();
+                    if !us.message.is_empty() {
+                        ui.add_space(4.0);
+                        let color = match us.phase {
+                            update::Phase::Error => DANGER,
+                            update::Phase::Available => ACCENT,
+                            _ => SECONDARY,
+                        };
+                        ui.label(RichText::new(&us.message).size(11.5).color(color));
+                    }
+                    if matches!(
+                        us.phase,
+                        update::Phase::Available | update::Phase::Ready
+                    ) {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if us.phase == update::Phase::Available
+                                && ui.button("下载新版本").clicked()
+                            {
+                                self.updater.download();
+                            }
+                            if us.phase == update::Phase::Ready
+                                && ui.button("立即重启更新").clicked()
+                            {
+                                match self.updater.install() {
+                                    Ok(()) => std::process::exit(0),
+                                    Err(e) => self.notify(e),
+                                }
+                            }
+                        });
+                    }
+                });
+            });
     }
 
     /// 托盘事件、关窗拦截、托盘提示刷新
@@ -1237,6 +1503,36 @@ impl eframe::App for App {
                 );
             });
 
+        // ---------- 左侧导航 ----------
+        let missing = deps::DEPS
+            .iter()
+            .filter(|d| !deps::installed(&self.root, d))
+            .count();
+        egui::Panel::left("nav")
+            .exact_size(146.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(PANEL)
+                    .inner_margin(Margin::symmetric(10, 12)),
+            )
+            .show(ui, |ui| {
+                nav_item(ui, "下载", Page::Download, &mut self.page);
+                ui.add_space(4.0);
+                nav_item(ui, "设置", Page::Settings, &mut self.page);
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    if missing > 0 && ui.button(format!("缺 {} 个依赖", missing)).clicked() {
+                        self.page = Page::Settings;
+                    }
+                    ui.label(
+                        RichText::new(format!("v{}", update::Updater::current()))
+                            .size(10.5)
+                            .color(MUTED),
+                    );
+                });
+            });
+
+        if self.page == Page::Download {
         // ---------- 输入区（Sakura composer 卡片） ----------
         egui::Panel::top("input")
             .frame(
@@ -1274,82 +1570,19 @@ impl eframe::App for App {
                                 self.add_task();
                             }
                         });
-                        ui.add_space(4.0);
+                        ui.add_space(5.0);
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new("并发").size(11.5).color(MUTED));
-                            ui.scope(|ui| {
-                                ui.spacing_mut().interact_size.y = 22.0;
-                                ui.add(
-                                    egui::DragValue::new(&mut self.cfg.conn)
-                                        .range(1..=64)
-                                        .suffix(" 路"),
-                                );
-                            });
-                            ui.add_space(6.0);
-                            ui.label(RichText::new("限速").size(11.5).color(MUTED));
-                            ui.scope(|ui| {
-                                ui.spacing_mut().interact_size.y = 22.0;
-                                let resp = ui.add(
-                                    egui::DragValue::new(&mut self.cfg.limit)
-                                        .range(0.0..=100.0)
-                                        .speed(0.5)
-                                        .suffix(" MB/s"),
-                                );
-                                if resp.changed() {
-                                    engine::set_speed_limit(self.cfg.limit);
-                                    save_config(&self.cfg);
-                                }
-                                let _ = resp.on_hover_text("0 表示不限速；只作用于内置下载引擎");
-                            });
-                            ui.add_space(6.0);
-                            ui.label(RichText::new("目录").size(11.5).color(MUTED));
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut self.dir_text)
-                                        .desired_width(250.0)
-                                        .margin(egui::vec2(6.0, 3.0)),
-                                )
-                                .changed()
-                            {
-                                self.cfg.dir = PathBuf::from(self.dir_text.clone());
-                                save_config(&self.cfg);
-                            }
-                            ui.add_space(6.0);
-                            ui.label(RichText::new("引擎").size(11.5).color(MUTED));
-                            egui::ComboBox::from_id_salt("engine")
-                                .selected_text(match self.cfg.engine.as_str() {
-                                    "aria2" => "aria2 优先",
-                                    _ => "自动（最快）",
-                                })
-                                .show_ui(ui, |ui| {
-                                    if ui
-                                        .selectable_value(
-                                            &mut self.cfg.engine,
-                                            "auto".to_string(),
-                                            "自动（最快）",
-                                        )
-                                        .clicked()
-                                    {
-                                        save_config(&self.cfg);
-                                    }
-                                    if ui
-                                        .selectable_value(
-                                            &mut self.cfg.engine,
-                                            "aria2".to_string(),
-                                            "aria2 优先",
-                                        )
-                                        .clicked()
-                                    {
-                                        save_config(&self.cfg);
-                                    }
-                                });
-                            ui.add_space(6.0);
                             ui.label(RichText::new("OpenList 路径").size(11.5).color(MUTED));
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.ol_path)
                                     .hint_text(RichText::new("/挂载点/文件名").color(MUTED))
-                                    .desired_width(160.0)
+                                    .desired_width(200.0)
                                     .margin(egui::vec2(6.0, 3.0)),
+                            );
+                            ui.label(
+                                RichText::new("并发 / 限速 / 目录 / 引擎在「设置」里")
+                                    .size(10.5)
+                                    .color(MUTED),
                             );
                         });
                     });
@@ -1400,7 +1633,9 @@ impl eframe::App for App {
                     });
             });
 
-        // ---------- 任务列表 ----------
+        }
+
+        // ---------- 任务列表 / 设置 ----------
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
@@ -1408,6 +1643,10 @@ impl eframe::App for App {
                     .inner_margin(Margin { left: 18, right: 18, top: 10, bottom: 10 }),
             )
             .show(ui, |ui| {
+                if self.page == Page::Settings {
+                    self.draw_settings(ui);
+                    return;
+                }
                 self.draw_update(ui);
                 if self.scan.is_some() {
                     self.draw_scan(ui);
