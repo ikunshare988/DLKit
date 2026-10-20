@@ -1,4 +1,4 @@
-# OST 下载器 一键启动：aria2 (RPC:6800) + OpenList (Web:5244)
+# DLKit 一键启动：aria2 (RPC:6800) + OpenList (Web:5244)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $log  = Join-Path $root 'logs'

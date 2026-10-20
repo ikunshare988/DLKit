@@ -1,4 +1,4 @@
-//! OST 下载器引擎：curl 分片 + aria2(BT/兜底) + yt-dlp(媒体) + OpenList(网盘直链)。
+//! DLKit 引擎：curl 分片 + aria2(BT/兜底) + yt-dlp(媒体) + OpenList(网盘直链)。
 
 use serde::Deserialize;
 use serde_json::{json, Value};

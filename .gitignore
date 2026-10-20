@@ -30,7 +30,7 @@
 *.exp
 
 # 例外：仓库内提供一份可直接运行的编译结果
-!/dist/OSTDownloader.exe
+!/dist/DLKit.exe
 
 # 编辑器
 .vscode/

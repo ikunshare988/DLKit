@@ -1,4 +1,4 @@
-﻿//! OST 下载器桌面界面（Rust + egui）。
+﻿//! DLKit 桌面界面（Rust + egui）。
 //! 视觉语言对齐 Sakura：天蓝主色、樱花粉点缀、浅色面板、大圆角、柔和描边与过渡。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -734,13 +734,13 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("●").size(11.0).color(ACCENT));
                     ui.label(
-                        RichText::new("OST 下载器")
+                        RichText::new("DLKit")
                             .size(21.0)
                             .strong()
                             .color(PRIMARY),
                     );
                     ui.add_space(2.0);
-                    ui.label(RichText::new("多线程下载工具").size(12.5).color(SECONDARY));
+                    ui.label(RichText::new("多功能下载器").size(12.5).color(SECONDARY));
                     ui.add_space(10.0);
                     ui.label(
                         RichText::new(format!("root: {}", self.root.display()))
@@ -1144,7 +1144,7 @@ fn headless() -> i32 {
     let url = match args.get(2) {
         Some(u) => u.clone(),
         None => {
-            println!("用法: OSTDownloader.exe --headless <url> [openlist:/path] [-c 32] [-d 目录]");
+            println!("用法: DLKit.exe --headless <url> [openlist:/path] [-c 32] [-d 目录]");
             return 2;
         }
     };
@@ -1224,7 +1224,7 @@ fn headless_scan() -> i32 {
     let url = match args.get(2) {
         Some(u) => u.clone(),
         None => {
-            println!("用法: OSTDownloader.exe --scan <下载页链接>");
+            println!("用法: DLKit.exe --scan <下载页链接>");
             return 2;
         }
     };
@@ -1298,11 +1298,11 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 620.0])
             .with_min_inner_size([800.0, 540.0])
-            .with_title("OST 下载器"),
+            .with_title("DLKit"),
         ..Default::default()
     };
     eframe::run_native(
-        "OST 下载器",
+        "DLKit",
         options,
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);

@@ -1,8 +1,8 @@
-# aria2 配置示例
+﻿# aria2 配置示例
 # 复制为 config/aria2.conf 后按需修改
 
 # 下载目录
-dir=D:\OSTDownloader\downloads
+dir=D:\DLKit\downloads
 
 # 单服务器最大连接数与分片数（aria2 上限 16）
 split=16
@@ -13,11 +13,11 @@ min-split-size=1M
 file-allocation=none
 
 # 断点续传会话
-input-file=D:\OSTDownloader\config\aria2.session
-save-session=D:\OSTDownloader\config\aria2.session
+input-file=D:\DLKit\config\aria2.session
+save-session=D:\DLKit\config\aria2.session
 
 # HTTPS 证书：吊销检查在部分网络下会失败，可改用 Mozilla CA bundle
-# ca-certificate=D:\OSTDownloader\config\cacert.pem
+# ca-certificate=D:\DLKit\config\cacert.pem
 check-certificate=true
 
 # RPC（本机使用）

@@ -1,6 +1,6 @@
-# OST 下载器
+# DLKit
 
-Windows 上的桌面下载工具。把链接粘进去，它会用多个连接分段下载；如果给的是软件下载页，它会先把页面里的文件列出来，勾选后批量下载。
+多功能下载器。Windows 上的桌面下载工具，把链接粘进去，它会用多个连接分段下载；如果给的是软件下载页，它会先把页面里的文件列出来，勾选后批量下载。
 
 界面用 Rust + egui 写，不需要浏览器内核，也不需要 Python 运行时。
 
@@ -36,7 +36,7 @@ Windows 上的桌面下载工具。把链接粘进去，它会用多个连接分
 
 ## 下载
 
-仓库里附带了一份已编译好的程序：[dist/OSTDownloader.exe](dist/OSTDownloader.exe)。
+仓库里附带了一份已编译好的程序：[dist/DLKit.exe](dist/DLKit.exe)。
 
 它是未签名的 exe，Windows 首次运行时可能提示“已保护你的电脑”，点“更多信息 → 仍要运行”即可。也可以按下面的说明自行编译。
 
@@ -45,7 +45,7 @@ Windows 上的桌面下载工具。把链接粘进去，它会用多个连接分
 程序本身是一个 exe，但下载能力依赖几个命令行工具。把它们放到程序目录下：
 
 ```
-OSTDownloader.exe
+DLKit.exe
 bin/
   aria2/aria2c.exe
   yt-dlp/yt-dlp.exe
@@ -65,7 +65,7 @@ downloads/
 
 启动：
 
-- 只下直链或解析页面：直接双击 `OSTDownloader.exe`
+- 只下直链或解析页面：直接双击 `DLKit.exe`
 - 需要 BT、网盘或 aria2 兜底：先运行 `start.ps1`，再打开程序
 
 ## 多源（镜像）
@@ -122,7 +122,7 @@ cd ui
 cargo build --release
 ```
 
-产物在 `ui/target/release/ost-downloader.exe`，复制到程序目录并改名为 `OSTDownloader.exe` 即可。
+产物在 `ui/target/release/dlkit.exe`，复制到程序目录并改名为 `DLKit.exe` 即可。
 
 如果拉取依赖很慢，可以按自己的网络环境配置 crates.io 镜像，例如在 `ui/.cargo/config.toml` 里指定 rsproxy。
 
@@ -132,10 +132,10 @@ cargo build --release
 
 ```powershell
 # 下载单个链接
-OSTDownloader.exe --headless "https://example.com/file.zip" -c 32 -d "D:\Downloads"
+DLKit.exe --headless "https://example.com/file.zip" -c 32 -d "D:\Downloads"
 
 # 只解析下载页，列出候选文件
-OSTDownloader.exe --scan "https://www.7-zip.org/download.html"
+DLKit.exe --scan "https://www.7-zip.org/download.html"
 ```
 
 ## 项目结构
