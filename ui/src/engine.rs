@@ -1663,12 +1663,12 @@ pub fn run_fast(
     };
     let mirror_pending = !cands.is_empty();
 
-    let lanes = ((conn as u64) * 3 / 2).max(1);
-    // 有镜像时把块切小一点：块数够多，后加入的镜像才有活可干，
-    // 否则几个大块一开始就被主源抢完，镜像只能空转。
-    let min_block = if mirror_pending { 1 << 20 } else { 4 << 20 };
+    let lanes = ((conn as u64) * 8).max(1);
+    // 块切得细一些：末期只剩少量分块时，慢连接手里那点活也能被别的
+    // 连接很快接走，不会出现「最后 10% 卡住十几秒」。
+    let min_block = 512u64 << 10;
     let block = ((size + lanes - 1) / lanes)
-        .clamp(min_block, 32 << 20)
+        .clamp(min_block, 16 << 20)
         .min(size.max(1));
     let total_blocks = ((size + block - 1) / block) as usize;
     let first_end = (block - 1).min(size - 1);
@@ -1843,9 +1843,6 @@ pub fn run_fast(
     let mut smooth_disk = 0.0f64;
     let mut snap = (0u64, 0u64);
     let mut last_save = Instant::now();
-    let mut best_speed = 0.0f64;
-    let mut low_streak = 0u32;
-    let mut last_tune = Instant::now() - Duration::from_secs(5);
     let mut src_last = sources.snapshot_bytes();
     let mut stalled: Vec<Option<Instant>> = vec![None; src_last.len()];
     loop {
@@ -1882,32 +1879,6 @@ pub fn run_fast(
             };
             snap = (db, dn);
             set_io(&task, speed, smooth_disk);
-
-            if now.duration_since(last_tune) >= Duration::from_secs(2) {
-                if speed > best_speed {
-                    best_speed = speed;
-                }
-                if best_speed > 4.0 && speed < best_speed * 0.6 {
-                    low_streak += 1;
-                } else {
-                    low_streak = 0;
-                }
-                let cap = limiter.cap();
-                if low_streak >= 2 && cap > 4 {
-                    let new_cap = (cap * 3 / 4).max(4);
-                    limiter.set_cap(new_cap);
-                    log_line(
-                        &task,
-                        format!(
-                            "吞吐下降（{:.1} MB/s），并发 {} → {} 路",
-                            speed, cap, new_cap
-                        ),
-                    );
-                    low_streak = 0;
-                    best_speed = speed.max(1.0);
-                }
-                last_tune = now;
-            }
 
             // 各源速度按「实际干活时长」算，空闲（没抢到分块）不计入。
             // 这样镜像只要干活时够快就不会被误判，也不会因为主源独占队列而被弃用。
