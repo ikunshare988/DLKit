@@ -1,7 +1,10 @@
 {
+  "_说明": "程序已内置常用镜像（HuggingFace / npm / Node.js / PyPI / GitHub 加速），普通用户可以不管这个文件。",
+  "_enabled": "false 表示完全不用镜像，只用主站下载",
+  "_rules": "写了 rules 就用它替换全部内置规则",
+  "_add": "add 里的规则追加在内置规则之后，适合只加一两个自己的镜像",
   "enabled": true,
-  "rules": [
-    { "from": "https://huggingface.co/", "to": "https://hf-mirror.com/" },
-    { "from": "https://registry.npmjs.org/", "to": "https://registry.npmmirror.com/" }
+  "add": [
+    { "from": "https://example.com/files/", "to": "https://mirror.example.com/files/" }
   ]
 }

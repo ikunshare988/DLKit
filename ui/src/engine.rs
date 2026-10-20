@@ -739,6 +739,10 @@ pub struct Sources {
     bytes: Vec<AtomicU64>,
     /// 正在下载的分块数
     inflight: Vec<AtomicUsize>,
+    /// 每个源实际下载的累计时长（纳秒），用于算「干活时的速度」
+    active_ns: Vec<AtomicU64>,
+    /// 当前这一轮干活从什么时候开始；没有在途分块时是 None
+    active_from: Mutex<Vec<Option<Instant>>>,
     /// 已经成功交付过分块的镜像，之后不受试用额度限制
     proven: Vec<AtomicBool>,
 }
@@ -751,6 +755,8 @@ impl Sources {
         let slow = list.iter().map(|_| AtomicBool::new(false)).collect();
         let bytes = list.iter().map(|_| AtomicU64::new(0)).collect();
         let inflight = list.iter().map(|_| AtomicUsize::new(0)).collect();
+        let active_ns = list.iter().map(|_| AtomicU64::new(0)).collect();
+        let active_from = list.iter().map(|_| None).collect();
         let mut proven = list.iter().map(|_| AtomicBool::new(false)).collect::<Vec<_>>();
         proven[0] = AtomicBool::new(true);
         Sources {
@@ -759,6 +765,8 @@ impl Sources {
             slow,
             bytes,
             inflight,
+            active_ns,
+            active_from: Mutex::new(active_from),
             proven,
         }
     }
@@ -776,9 +784,10 @@ impl Sources {
     }
 
     /// 按分块序号做起始轮换，重试时顺延；跳过失败、过慢和未就绪的源。
-    /// 未验证过吞吐的镜像最多同时占 1 块：即使它卡住，也只影响这一块。
+    /// 未验证过吞吐的镜像最多同时占 3 块：分块够多时才不至于只分到一块，
+    /// 真慢的话 1 秒内就会被弃用，占用也只是很短时间。
     fn pick(&self, lane: usize, attempt: u32) -> Option<(usize, String)> {
-        const PROBATION: usize = 1;
+        const PROBATION: usize = 3;
         let list = self.list.lock().unwrap();
         let n = list.len();
         if n == 0 {
@@ -811,13 +820,25 @@ impl Sources {
 
     fn begin(&self, i: usize) {
         if let Some(c) = self.inflight.get(i) {
-            c.fetch_add(1, Ordering::Relaxed);
+            // 从「空闲」变成「有活干」时开始计时
+            if c.fetch_add(1, Ordering::Relaxed) == 0 {
+                if let Some(slot) = self.active_from.lock().unwrap().get_mut(i) {
+                    *slot = Some(Instant::now());
+                }
+            }
         }
     }
 
     fn end(&self, i: usize) {
         if let Some(c) = self.inflight.get(i) {
-            c.fetch_sub(1, Ordering::Relaxed);
+            if c.fetch_sub(1, Ordering::Relaxed) == 1 {
+                let mut g = self.active_from.lock().unwrap();
+                if let Some(t0) = g.get_mut(i).and_then(|s| s.take()) {
+                    if let Some(ns) = self.active_ns.get(i) {
+                        ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    }
+                }
+            }
         }
     }
 
@@ -846,6 +867,31 @@ impl Sources {
         }
     }
 
+    /// 某个源实际干活的累计时长。
+    /// 速度要按这个算，而不是按墙钟：分块被主源抢完时镜像会空闲，
+    /// 空闲时间若计入窗口，就会把健康的高速镜像误判成「过慢」。
+    fn active_secs(&self, i: usize) -> f64 {
+        let mut ns = self
+            .active_ns
+            .get(i)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        // 正在下载的那一段也要算进去
+        if let Some(Some(t0)) = self.active_from.lock().unwrap().get(i) {
+            ns += t0.elapsed().as_nanos() as u64;
+        }
+        ns as f64 / 1e9
+    }
+
+    fn speed_of(&self, i: usize) -> f64 {
+        let secs = self.active_secs(i);
+        if secs < 1.0 {
+            return 0.0;
+        }
+        let bytes = self.bytes.get(i).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+        bytes as f64 / 1048576.0 / secs
+    }
+
     fn is_slow(&self, i: usize) -> bool {
         self.slow.get(i).map(|f| f.load(Ordering::Relaxed)).unwrap_or(false)
     }
@@ -872,11 +918,46 @@ struct MirrorRules {
     rules: Vec<(String, String)>,
 }
 
+/// 内置的默认镜像规则：普通用户不用配置也能用上。
+/// 只在「同一文件在镜像上也能取到、且内容一致」时才生效，
+/// 校验不通过的镜像会被丢弃，所以多写几条不会下坏文件。
+fn default_mirror_rules() -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = Vec::new();
+    // 模型 / 数据集
+    v.push(("https://huggingface.co/".into(), "https://hf-mirror.com/".into()));
+    // npm 包
+    v.push((
+        "https://registry.npmjs.org/".into(),
+        "https://registry.npmmirror.com/".into(),
+    ));
+    // Node.js 官方发行包
+    v.push((
+        "https://nodejs.org/dist/".into(),
+        "https://npmmirror.com/mirrors/node/".into(),
+    ));
+    // Python 包（清华源，路径结构与 files.pythonhosted.org 一致）
+    v.push((
+        "https://files.pythonhosted.org/".into(),
+        "https://pypi.tuna.tsinghua.edu.cn/".into(),
+    ));
+    // GitHub 下载加速：多个站点互为备份，哪个能通过校验就用哪个
+    for host in ["github.com", "raw.githubusercontent.com", "codeload.github.com"] {
+        for proxy in ["ghfast.top", "gh-proxy.com", "ghproxy.net"] {
+            v.push((
+                format!("https://{}/", host),
+                format!("https://{}/https://{}/", proxy, host),
+            ));
+        }
+    }
+    v
+}
+
 fn mirror_rules() -> MirrorRules {
-    // 默认不带任何镜像规则：镜像是否更快取决于用户所在网络，
-    // 写死规则可能反而把下载变慢。需要的用户把 config/mirrors.example.json
-    // 复制成 config/mirrors.json 再按需修改。
-    let mut rules: Vec<(String, String)> = Vec::new();
+    // 默认启用内置镜像；用户可以在 config/mirrors.json 里：
+    //   enabled=false  完全关闭
+    //   rules=[...]    用自己的规则替换内置规则
+    //   add=[...]      在内置规则之外追加
+    let mut rules = default_mirror_rules();
     let mut enabled = true;
     let path = find_root().join("config").join("mirrors.json");
     if let Ok(text) = fs::read_to_string(&path) {
@@ -884,29 +965,37 @@ fn mirror_rules() -> MirrorRules {
         struct Raw {
             enabled: Option<bool>,
             rules: Option<Vec<RawRule>>,
+            add: Option<Vec<RawRule>>,
         }
         #[derive(Deserialize)]
         struct RawRule {
             from: String,
             to: String,
         }
+        fn clean(list: Vec<RawRule>) -> Vec<(String, String)> {
+            list.into_iter()
+                .filter(|r| !r.from.is_empty() && !r.to.is_empty())
+                .map(|r| (r.from, r.to))
+                .collect()
+        }
         if let Ok(raw) = serde_json::from_str::<Raw>(&text) {
             if let Some(e) = raw.enabled {
                 enabled = e;
             }
             if let Some(list) = raw.rules {
-                rules = list
-                    .into_iter()
-                    .filter(|r| !r.from.is_empty() && !r.to.is_empty())
-                    .map(|r| (r.from, r.to))
-                    .collect();
+                rules = clean(list);
+            }
+            if let Some(list) = raw.add {
+                rules.extend(clean(list));
             }
         }
     }
     MirrorRules { enabled, rules }
 }
 
-fn mirror_candidates(url: &str) -> Vec<String> {
+/// 生成的候选镜像地址。同一个 URL 可能命中多条规则，按出现顺序去重。
+/// 上限 8 个：再多也只是多几个几乎必然被校验淘汰的探测。
+fn mirror_candidates(url: &str, limit: usize) -> Vec<String> {
     let cfg = mirror_rules();
     if !cfg.enabled {
         return Vec::new();
@@ -917,6 +1006,26 @@ fn mirror_candidates(url: &str) -> Vec<String> {
             let full = format!("{}{}", to, rest);
             if full != url && !out.contains(&full) {
                 out.push(full);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 同时按「原始链接」和「重定向后的最终地址」找镜像：
+/// GitHub 的下载链接重定向后变成签名地址，只有原始链接才可能被代理接住。
+fn mirror_candidates_for(urls: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for u in urls {
+        for c in mirror_candidates(u, 8) {
+            if !out.contains(&c) && !urls.contains(&c.as_str()) {
+                out.push(c);
+                if out.len() >= 8 {
+                    return out;
+                }
             }
         }
     }
@@ -925,12 +1034,13 @@ fn mirror_candidates(url: &str) -> Vec<String> {
 
 /// 校验单个镜像：Range 取开头 1KB，必须返回 206、总长度与主源一致，
 /// 并且开头字节也要一致（同长度不同内容的文件不能混进来）。
+/// 返回 Ok(()) 表示可用，Err 里是放弃原因（只在调试时输出）。
 fn verify_mirror(
     url: &str,
     size: u64,
     headers: &BTreeMap<String, String>,
     head_bytes: &Arc<Mutex<Vec<u8>>>,
-) -> bool {
+) -> Result<(), String> {
     let hdr = std::env::temp_dir().join(format!(
         ".dlkit-mirror-{}-{}.hdr",
         std::process::id(),
@@ -949,18 +1059,28 @@ fn verify_mirror(
     a.extend(header_args(headers));
     a.push(url.to_string());
     let result = match curl_bytes(&a) {
-        Ok((body, _, _)) => {
+        Ok((body, err, _)) => {
             let text = fs::read_to_string(&hdr).unwrap_or_default();
             let (status, hdrs) = parse_response(&text);
-            let total_ok = hdrs
+            let total = hdrs
                 .get("content-range")
                 .and_then(|v| v.rsplit('/').next())
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .map(|t| t == size)
-                .unwrap_or(false);
-            status == Some(206) && total_ok && head_matches(&body, head_bytes, size)
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            if status != Some(206) {
+                Err(format!(
+                    "HTTP {:?} {}",
+                    status,
+                    err.trim().lines().next().unwrap_or("")
+                ))
+            } else if total != Some(size) {
+                Err(format!("长度不符 {:?} != {}", total, size))
+            } else if !head_matches(&body, head_bytes, size) {
+                Err("开头字节与主源不一致".into())
+            } else {
+                Ok(())
+            }
         }
-        Err(_) => false,
+        Err(e) => Err(e),
     };
     let _ = fs::remove_file(&hdr);
     result
@@ -1166,6 +1286,8 @@ pub fn run_fast(
         Ok(c) => c,
         Err(e) => return Err(EngErr::Fatal(format!("无法启动 curl：{}", e))),
     };
+    // 用于估算引导连接的实测速度：主源够快时就不必等镜像
+    let spawned_at = Instant::now();
 
     let file = Arc::new(
         OpenOptions::new()
@@ -1308,7 +1430,7 @@ pub fn run_fast(
 
     // 镜像校验放到后台：worker 先用主源开工，校验通过的镜像再逐个加入。
     let cands = if size >= 4 << 20 && std::env::var("DLKIT_NO_MIRROR").is_err() {
-        mirror_candidates(&fetch_url)
+        mirror_candidates_for(&[url, fetch_url.as_str()])
     } else {
         Vec::new()
     };
@@ -1330,25 +1452,36 @@ pub fn run_fast(
 
     let sources = Arc::new(Sources::new(fetch_url.clone(), cands.len()));
     if mirror_pending {
-        let sources_v = sources.clone();
-        let headers_v = headers.clone();
-        let head_v = head_bytes.clone();
-        let task_v = task.clone();
-        thread::spawn(move || {
-            for (i, url) in cands.into_iter().enumerate() {
-                if verify_mirror(&url, size, &headers_v, &head_v) {
-                    sources_v.set_url(i + 1, url.clone());
-                    log_line(
-                        &task_v,
-                        format!(
-                            "镜像已加入：{}（{} 源并行下载）",
-                            host_of(&url).unwrap_or_else(|| url.clone()),
-                            sources_v.ready()
-                        ),
-                    );
+        // 每个候选各起一个校验线程：先通过的先加入，不必排在前面的慢镜像后面
+        for (i, curl_url) in cands.into_iter().enumerate() {
+            let sources_v = sources.clone();
+            let headers_v = headers.clone();
+            let head_v = head_bytes.clone();
+            let task_v = task.clone();
+            thread::spawn(move || {
+                match verify_mirror(&curl_url, size, &headers_v, &head_v) {
+                    Ok(()) => {
+                        sources_v.set_url(i + 1, curl_url.clone());
+                        log_line(
+                            &task_v,
+                            format!(
+                                "镜像已加入：{}（{} 源并行下载）",
+                                host_of(&curl_url).unwrap_or_else(|| curl_url.clone()),
+                                sources_v.ready()
+                            ),
+                        );
+                    }
+                    Err(why) => {
+                        if std::env::var("DLKIT_DEBUG_MIRROR").is_ok() {
+                            log_line(
+                                &task_v,
+                                format!("镜像校验未通过：{}（{}）", curl_url, why),
+                            );
+                        }
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     if let Ok(mut t) = task.lock() {
@@ -1417,11 +1550,16 @@ pub fn run_fast(
 
     let worker_count = conn.saturating_sub(1).max(1).min(total_blocks.saturating_sub(1).max(1));
     // 有镜像候选时给校验留一点时间：分块一旦被 worker 抢完，后加入的镜像就没活可干。
-    // 只等 400ms，本地/就近镜像通常来得及；慢镜像迟到也不会拖住整体。
+    // 主源本身已经很给力（探测阶段就跑出高速）时不必等 —— 这时镜像大概率帮不上忙，
+    // 白等 400ms 反而拖慢。慢的时候才等，最多 400ms。
     if mirror_pending {
-        let deadline = Instant::now() + Duration::from_millis(400);
-        while Instant::now() < deadline && sources.ready() == 1 {
-            thread::sleep(Duration::from_millis(20));
+        let boot_secs = spawned_at.elapsed().as_secs_f64().max(0.05);
+        let boot_speed = written.load(Ordering::SeqCst) as f64 / 1048576.0 / boot_secs;
+        if boot_speed < 10.0 {
+            let deadline = Instant::now() + Duration::from_millis(400);
+            while Instant::now() < deadline && sources.ready() == 1 {
+                thread::sleep(Duration::from_millis(20));
+            }
         }
     }
     let mut handles = Vec::new();
@@ -1474,10 +1612,7 @@ pub fn run_fast(
     let mut best_speed = 0.0f64;
     let mut low_streak = 0u32;
     let mut last_tune = Instant::now() - Duration::from_secs(5);
-    let mut src_snap = sources.snapshot_bytes();
-    let mut src_t = Instant::now();
-    let mut src_ready_n = 1usize;
-    let mut src_last = src_snap.clone();
+    let mut src_last = sources.snapshot_bytes();
     let mut stalled: Vec<Option<Instant>> = vec![None; src_last.len()];
     loop {
         let all_workers = handles.iter().all(|h| h.is_finished());
@@ -1540,18 +1675,12 @@ pub fn run_fast(
                 last_tune = now;
             }
 
-            // 每 2 秒比较各源实际吞吐，明显偏慢的镜像不再分配分块。
-            // 后台新加入镜像时重置统计窗口，避免把「加入前的空窗」算成低速度
+            // 各源速度按「实际干活时长」算，空闲（没抢到分块）不计入。
+            // 这样镜像只要干活时够快就不会被误判，也不会因为主源独占队列而被弃用。
             let ready = sources.ready_flags();
             let ready_n = ready.iter().filter(|r| **r).count();
             let cur_b = sources.snapshot_bytes();
-            if ready_n != src_ready_n {
-                src_ready_n = ready_n;
-                src_snap = cur_b.clone();
-                src_t = now;
-            }
-            // 卡死检测：有在途分块却 1.5 秒一个字节都没收到，直接弃用，
-            // 不等 2 秒窗口的速度比较（第一次连接可能卡在重定向或建连上）
+            // 卡死检测：有在途分块却 1 秒一个字节都没收到，直接弃用
             if ready_n > 1 {
                 for i in 1..ready.len() {
                     if !ready[i] {
@@ -1573,25 +1702,16 @@ pub fn run_fast(
                     }
                 }
             }
-            src_last = cur_b.clone();
-            if ready_n > 1 && now.duration_since(src_t) >= Duration::from_secs(2) {
-                let dt_s = now.duration_since(src_t).as_secs_f64().max(0.001);
-                let speeds: Vec<f64> = cur_b
-                    .iter()
-                    .zip(src_snap.iter())
-                    .map(|(a, b)| a.saturating_sub(*b) as f64 / 1048576.0 / dt_s)
+            src_last = cur_b;
+            if ready_n > 1 {
+                // 0.0 表示该源干活时间还不到 1 秒，样本不足，不参与比较
+                let speeds: Vec<f64> = (0..ready.len())
+                    .map(|i| if ready[i] { sources.speed_of(i) } else { 0.0 })
                     .collect();
-                let fastest = speeds
-                    .iter()
-                    .zip(ready.iter())
-                    .filter(|(_, r)| **r)
-                    .map(|(s, _)| *s)
-                    .fold(0.0f64, f64::max);
+                let fastest = speeds.iter().fold(0.0f64, |a, b| a.max(*b));
                 if fastest >= 0.5 {
                     for i in 1..speeds.len() {
-                        // 只判断真正在干活的源：刚加入还没分到块的镜像不能算慢
-                        let active = sources.busy(i) || speeds[i] > 0.0;
-                        if ready[i] && active && speeds[i] < fastest * 0.25 && sources.mark_slow(i) {
+                        if ready[i] && speeds[i] > 0.0 && speeds[i] < fastest * 0.25 && sources.mark_slow(i) {
                             log_line(
                                 &task,
                                 format!(
@@ -1602,8 +1722,6 @@ pub fn run_fast(
                         }
                     }
                 }
-                src_snap = cur_b;
-                src_t = now;
             }
             last_done = cur;
             last_t = now;
@@ -1982,6 +2100,7 @@ fn fetch_block(
                 format!("块 {}-{} 由源 {} 下载（第 {} 次）", off, end, src_idx, attempt),
             );
         }
+        let block_start = Instant::now();
         struct SrcGuard<'a>(&'a Sources, usize);
         impl Drop for SrcGuard<'_> {
             fn drop(&mut self) {
@@ -2171,6 +2290,20 @@ fn fetch_block(
         // Range 请求只要字节数收齐就是完整数据，不因 curl 退出码/连接收尾方式判失败
         if written == want {
             sources.prove(src_idx);
+            if std::env::var("DLKIT_DEBUG_SRC").is_ok() {
+                let secs = block_start.elapsed().as_secs_f64().max(0.001);
+                log_line(
+                    task,
+                    format!(
+                        "块 {}-{} 完成，源 {}，{:.2}s（{:.2} MB/s）",
+                        off,
+                        end,
+                        src_idx,
+                        secs,
+                        want as f64 / 1048576.0 / secs
+                    ),
+                );
+            }
             return true;
         }
         if written > 0 {
