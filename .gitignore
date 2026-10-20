@@ -1,6 +1,7 @@
 # 本地依赖（体积很大，不随仓库分发）
 /bin/
 /downloads/
+/quarantine/
 /data/
 /logs/
 /.bench/
@@ -16,6 +17,9 @@
 /config/openlist.json
 /config/ui.json
 /config/accounts.json
+/config/watches.json
+/config/policy.json
+/config/security.json
 /config/mirrors.json
 /config/cacert.pem
 

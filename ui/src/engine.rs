@@ -93,7 +93,46 @@ pub struct Task {
     /// 官方清单给出的 SHA256（可选），下载完成后自动核对
     pub sha256: Option<String>,
     pub output: Option<PathBuf>,
+    /// 下载完成后的安全检查结果（增强版）
+    pub av: Option<crate::av::Report>,
+    /// 单任务限速（来自策略 profile），None 表示只受全局限速约束
+    pub rate: Option<Arc<TaskRate>>,
     pub started: Instant,
+}
+
+/// 单任务令牌桶：按 profile 的 limit_mbps 卡住这条任务，不影响其他任务
+pub struct TaskRate {
+    bps: f64,
+    next: Mutex<Instant>,
+}
+
+impl TaskRate {
+    pub fn new(mbps: f64) -> TaskRate {
+        TaskRate {
+            bps: mbps.max(0.0) * 1024.0 * 1024.0,
+            next: Mutex::new(Instant::now()),
+        }
+    }
+
+    pub fn throttle(&self, bytes: u64) {
+        if self.bps <= 0.0 {
+            return;
+        }
+        let secs = bytes as f64 / self.bps;
+        let mut next = match self.next.lock() {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        let now = Instant::now();
+        if *next < now {
+            *next = now;
+        }
+        *next += Duration::from_secs_f64(secs);
+        let wait = next.saturating_duration_since(now);
+        if wait > Duration::ZERO {
+            thread::sleep(wait);
+        }
+    }
 }
 
 pub type Shared = Arc<Mutex<Task>>;
@@ -117,6 +156,8 @@ impl Task {
             spawn: None,
             sha256: None,
             output: None,
+            av: None,
+            rate: None,
             started: Instant::now(),
         }
     }
@@ -315,6 +356,11 @@ fn free_space(dir: &Path) -> Option<u64> {
 #[cfg(not(windows))]
 fn free_space(_dir: &Path) -> Option<u64> {
     None
+}
+
+/// 给环境检查用的公开入口
+pub fn disk_free(dir: &Path) -> Option<u64> {
+    free_space(dir)
 }
 
 fn human_size(n: u64) -> String {
@@ -633,6 +679,116 @@ pub fn probe(url: &str, headers: &BTreeMap<String, String>) -> Result<Probe, Eng
         ranges,
         name: sanitize_name(&name),
         probe_ms,
+    })
+}
+
+// ---------------- 链接跟踪用的轻量探测 ----------------
+
+/// 链接跟踪只需要响应头：状态码、ETag、Last-Modified、长度、最终地址、文件名。
+/// 和 probe 的区别是不因 4xx 直接报错（404 要单独标记成「失效」），
+/// 也不探测分片能力，尽量把每次轮询的请求压到最小。
+pub struct HeadInfo {
+    pub status: u16,
+    /// 跟随重定向后的最终地址（去掉 query 后可用来判断 releases/latest 这类链接的版本）
+    pub url: String,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub content_length: Option<u64>,
+    pub filename: String,
+}
+
+pub fn head_info(url: &str, headers: &BTreeMap<String, String>) -> Result<HeadInfo, EngErr> {
+    let mut args: Vec<String> = [
+        "-sS",
+        "-I",
+        "-L",
+        "--http1.1",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "20",
+        "-w",
+        "\n__DLKIT_EFF__%{url_effective}",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    args.extend(header_args(headers));
+    args.push(url.to_string());
+    let (out, _err, _code) = curl(&args).map_err(EngErr::Soft)?;
+    let (out, eff) = split_eff(out);
+    let (status, hdrs) = parse_response(&out);
+    let mut code = status.unwrap_or(0);
+    let mut final_url = eff.unwrap_or_else(|| url.to_string());
+    let mut h = hdrs;
+
+    // 304 是条件请求命中，本身就没有长度，不要再去补探
+    let need_probe =
+        code != 304 && (code == 0 || code == 403 || code == 405 || code == 501 || !h.contains_key("content-length"));
+    if need_probe {
+        let mut a: Vec<String> = [
+            "-sS",
+            "-L",
+            "--http1.1",
+            "-o",
+            "NUL",
+            "-D",
+            "-",
+            "-r",
+            "0-1",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "20",
+            "-w",
+            "\n__DLKIT_EFF__%{url_effective}",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        a.extend(header_args(headers));
+        a.push(url.to_string());
+        if let Ok((o2, _e2, _c2)) = curl(&a) {
+            let (o2, eff2) = split_eff(o2);
+            let (st2, h2) = parse_response(&o2);
+            if let Some(c) = st2 {
+                code = c;
+            }
+            if let Some(e) = eff2 {
+                final_url = e;
+            }
+            h = h2;
+        }
+    }
+
+    let content_length = h
+        .get("content-length")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .or_else(|| {
+            h.get("content-range")
+                .and_then(|v| v.rsplit('/').next().and_then(|s| s.parse::<u64>().ok()))
+                .filter(|v| *v > 0)
+        });
+
+    let filename = h
+        .get("content-disposition")
+        .and_then(|cd| {
+            cd.split(';').find_map(|seg| {
+                let seg = seg.trim();
+                seg.strip_prefix("filename=")
+                    .map(|v| v.trim_matches('"').to_string())
+            })
+        })
+        .unwrap_or_else(|| filename_from_url(&final_url));
+
+    Ok(HeadInfo {
+        status: code,
+        url: final_url,
+        etag: h.get("etag").cloned(),
+        last_modified: h.get("last-modified").cloned(),
+        content_length,
+        filename: sanitize_name(&filename),
     })
 }
 
@@ -1009,7 +1165,26 @@ impl Sources {
         self.list.lock().unwrap().iter().filter(|s| s.is_some()).count()
     }
 
-    /// 按分块序号做起始轮换，重试时顺延；跳过失败、过慢和未就绪的源。
+    /// 源的实测吞吐权重（字节/纳秒）；还没测出来的给中等权重
+    fn weight(&self, i: usize) -> f64 {
+        let ns = self
+            .active_ns
+            .get(i)
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let b = self
+            .bytes
+            .get(i)
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        if ns == 0 || b == 0 {
+            return 0.5;
+        }
+        (b as f64 / ns as f64).max(0.05)
+    }
+
+    /// 按分块序号做加权轮换：吞吐越高的源分到越多分块，重试时顺延；
+    /// 跳过失败、过慢和未就绪的源。
     /// 未验证过吞吐的镜像最多同时占 3 块：分块够多时才不至于只分到一块，
     /// 真慢的话 1 秒内就会被弃用，占用也只是很短时间。
     fn pick(&self, lane: usize, attempt: u32) -> Option<(usize, String)> {
@@ -1019,11 +1194,11 @@ impl Sources {
         if n == 0 {
             return None;
         }
-        let start = (lane + attempt as usize) % n;
         // pass 0：正常挑选；pass 1：允许过慢的源；pass 2：忽略试用额度
         for pass in 0..3 {
+            let mut cands: Vec<usize> = Vec::new();
             for k in 0..n {
-                let i = (start + k) % n;
+                let i = (lane + k) % n;
                 if self.bad[i].load(Ordering::Relaxed) {
                     continue;
                 }
@@ -1036,9 +1211,31 @@ impl Sources {
                 {
                     continue;
                 }
-                if let Some(u) = &list[i] {
-                    return Some((i, u.clone()));
+                if list[i].is_some() {
+                    cands.push(i);
                 }
+            }
+            if cands.is_empty() {
+                continue;
+            }
+            let total: f64 = cands.iter().map(|i| self.weight(*i)).sum();
+            let r = ((lane as u64)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(attempt as u64 * 40_503)
+                % 10_000) as f64
+                / 10_000.0
+                * total;
+            let mut acc = 0.0;
+            let mut chosen = cands[0];
+            for i in &cands {
+                acc += self.weight(*i);
+                if r <= acc {
+                    chosen = *i;
+                    break;
+                }
+            }
+            if let Some(u) = &list[chosen] {
+                return Some((chosen, u.clone()));
             }
         }
         None
@@ -2134,6 +2331,7 @@ struct PoolCtx {
     active: AtomicUsize,
     fails: AtomicUsize,
     head_bytes: Arc<Mutex<Vec<u8>>>,
+    rate: Option<Arc<TaskRate>>,
 }
 
 impl PoolCtx {
@@ -2283,6 +2481,9 @@ impl PoolCtx {
                             break;
                         }
                         bandwidth().throttle(take as u64);
+                        if let Some(r) = &self.rate {
+                            r.throttle(take as u64);
+                        }
                         let tw = Instant::now();
                         if self.file.seek_write(&buf[..take], off).is_err() {
                             self.sources.end(src_idx);
@@ -2386,6 +2587,7 @@ pub fn run_pool(
 
     let conn = conn.max(1);
     let extra = ((conn as f64 * 0.25).ceil() as usize).max(1).min(16);
+    let rate = task.lock().ok().and_then(|t| t.rate.clone());
     let client = pool_client(conn + extra)?;
 
     let name0 = pick_name(out_dir, &sanitize_name(&filename_from_url(url)), None);
@@ -2485,6 +2687,9 @@ pub fn run_pool(
                 Ok(0) => break,
                 Ok(n) => {
                     bandwidth().throttle(n as u64);
+                    if let Some(r) = &rate {
+                        r.throttle(n as u64);
+                    }
                     if file.seek_write(&buf[..n], off).is_err() {
                         return Err(EngErr::Fatal("写入磁盘失败".into()));
                     }
@@ -2631,6 +2836,7 @@ pub fn run_pool(
         active: AtomicUsize::new(0),
         fails: AtomicUsize::new(0),
         head_bytes: head_bytes.clone(),
+        rate,
     });
 
     // 首段：已经在传的这条连接直接写进文件
@@ -2658,6 +2864,9 @@ pub fn run_pool(
                             break;
                         }
                         bandwidth().throttle(take as u64);
+                        if let Some(r) = &ctx.rate {
+                            r.throttle(take as u64);
+                        }
                         let tw = Instant::now();
                         if ctx.file.seek_write(&buf[..take], off).is_err() {
                             ctx.fail("写入磁盘失败");
@@ -4466,6 +4675,27 @@ pub fn cancel_task(task: &Shared) {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn faster_source_gets_more_lanes() {
+        let s = Sources::new("a".to_string(), 2);
+        s.set_url(1, "b".to_string());
+        s.set_url(2, "c".to_string());
+        s.prove(1);
+        s.prove(2);
+        // b 的吞吐是 c 的 100 倍
+        s.bytes[1].store(100_000, Ordering::Relaxed);
+        s.active_ns[1].store(1_000, Ordering::Relaxed);
+        s.bytes[2].store(1_000, Ordering::Relaxed);
+        s.active_ns[2].store(1_000, Ordering::Relaxed);
+        let mut counts = [0usize; 3];
+        for lane in 0..3000 {
+            if let Some((i, _)) = s.pick(lane, 0) {
+                counts[i] += 1;
+            }
+        }
+        assert!(counts[1] > counts[2] * 10, "{:?}", counts);
+    }
 
     /// 本地测试服务器：支持 Range，单连接约 2MB/s，便于在下载中途暂停
     fn test_server(size: usize) -> (String, Vec<u8>) {

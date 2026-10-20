@@ -6,6 +6,11 @@
 //! 第 0 层是用户给的页面，第 1 层只跟进同源且看起来像下载页的链接。
 
 use crate::engine;
+use reqwest::blocking::Client;
+use reqwest::header::{
+    ACCEPT, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, COOKIE, RANGE,
+    REFERER,
+};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -103,13 +108,66 @@ fn cancelled(shared: &ScanShared) -> bool {
         .unwrap_or(true)
 }
 
+type CacheEntry = (Instant, Vec<Candidate>, BTreeMap<String, String>);
+type CacheMap = BTreeMap<String, CacheEntry>;
+static CACHE: std::sync::OnceLock<Mutex<CacheMap>> = std::sync::OnceLock::new();
+const CACHE_TTL: Duration = Duration::from_secs(600);
+const CACHE_MAX: usize = 16;
+
+fn cache() -> &'static Mutex<CacheMap> {
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// 同一页面 10 分钟内再解析直接复用结果（候选 + 下载要用的 Referer/Cookie）
+fn cache_get(url: &str) -> Option<(Vec<Candidate>, BTreeMap<String, String>)> {
+    let mut m = cache().lock().ok()?;
+    let (at, list, headers) = m.get(url)?;
+    if at.elapsed() > CACHE_TTL {
+        m.remove(url);
+        return None;
+    }
+    Some((list.clone(), headers.clone()))
+}
+
+fn cache_put(url: &str, list: &[Candidate], headers: &BTreeMap<String, String>) {
+    if list.is_empty() {
+        return;
+    }
+    if let Ok(mut m) = cache().lock() {
+        if m.len() >= CACHE_MAX {
+            m.clear();
+        }
+        m.insert(url.to_string(), (Instant::now(), list.to_vec(), headers.clone()));
+    }
+}
+
 fn run(shared: ScanShared, page_url: String) {
+    if let Some((list, headers)) = cache_get(&page_url) {
+        finish(&shared, Ok(list), headers);
+        return;
+    }
     let jar = std::env::temp_dir().join(format!("dlkit-scan-{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&jar);
     let result = scan(&shared, &page_url, &jar);
     let cookie = read_cookie_jar(&jar);
     let _ = std::fs::remove_file(&jar);
 
+    let mut headers = BTreeMap::new();
+    headers.insert("Referer".into(), page_url.clone());
+    if !cookie.is_empty() {
+        headers.insert("Cookie".into(), cookie);
+    }
+    if let Ok(list) = &result {
+        cache_put(&page_url, list, &headers);
+    }
+    finish(&shared, result, headers);
+}
+
+fn finish(
+    shared: &ScanShared,
+    result: Result<Vec<Candidate>, String>,
+    headers: BTreeMap<String, String>,
+) {
     if let Ok(mut st) = shared.lock() {
         st.running = false;
         match result {
@@ -154,12 +212,7 @@ fn run(shared: ScanShared, page_url: String) {
                 } else {
                     format!("解析完成，共 {} 个可下载文件", st.candidates.len())
                 };
-                let mut h = BTreeMap::new();
-                h.insert("Referer".into(), page_url.clone());
-                if !cookie.is_empty() {
-                    h.insert("Cookie".into(), cookie);
-                }
-                st.headers = h;
+                st.headers = headers;
             }
             Err(e) => {
                 if !st.cancel.load(Ordering::SeqCst) {
@@ -361,6 +414,219 @@ struct Raw {
     sha256: Option<String>,
 }
 
+// ---------------- GitHub 发布信息 ----------------
+
+#[derive(serde::Deserialize)]
+struct GhRelease {
+    tag_name: String,
+    #[serde(default)]
+    assets: Vec<GhAsset>,
+}
+
+#[derive(serde::Deserialize)]
+struct GhAsset {
+    name: String,
+    browser_download_url: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    size: u64,
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+/// 仓库首页 / releases 页 → 调 API 拿资产列表。
+/// 失败（限流、非仓库页、网络问题）返回 None，回退到 HTML 解析。
+fn github_release_files(page_url: &str) -> Option<Vec<(String, String, Option<String>)>> {
+    let rest = page_url.split("://").nth(1)?;
+    let (host, tail) = rest.split_once('/')?;
+    if !host.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    let path = tail.split(['?', '#']).next().unwrap_or(tail);
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() < 2 {
+        return None;
+    }
+    let owner = segs[0];
+    let repo = segs[1].trim_end_matches(".git");
+
+    let api = match segs.get(2).copied() {
+        None => format!("https://api.github.com/repos/{}/{}/releases/latest", owner, repo),
+        Some("releases") => match (segs.get(3).copied(), segs.get(4).copied()) {
+            (Some("tag"), Some(tag)) => format!(
+                "https://api.github.com/repos/{}/{}/releases/tags/{}",
+                owner, repo, tag
+            ),
+            (Some("tag"), None) => return None,
+            _ => format!("https://api.github.com/repos/{}/{}/releases/latest", owner, repo),
+        },
+        Some(_) => return None,
+    };
+
+    let client = http_client()?;
+    let resp = client
+        .get(&api)
+        .header(ACCEPT, "application/vnd.github+json")
+        .timeout(Duration::from_secs(8))
+        .send()
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let rel: GhRelease = resp.json().ok()?;
+    if rel.assets.is_empty() {
+        return None;
+    }
+    let tag = rel.tag_name;
+    Some(
+        rel.assets
+            .into_iter()
+            .map(|a| {
+                let sha = a
+                    .digest
+                    .as_deref()
+                    .and_then(|d| d.strip_prefix("sha256:"))
+                    .map(|s| s.to_ascii_lowercase())
+                    .filter(|s| s.len() == 64);
+                (a.browser_download_url, format!("{}  {}", a.name, tag), sha)
+            })
+            .collect(),
+    )
+}
+
+// ---------------- npm / PyPI ----------------
+
+#[derive(serde::Deserialize)]
+struct NpmLatest {
+    name: String,
+    version: String,
+    #[serde(default)]
+    dist: Option<NpmDist>,
+}
+
+#[derive(serde::Deserialize)]
+struct NpmDist {
+    tarball: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PypiRoot {
+    info: PypiInfo,
+    #[serde(default)]
+    urls: Vec<PypiFile>,
+}
+
+#[derive(serde::Deserialize)]
+struct PypiInfo {
+    name: String,
+    version: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PypiFile {
+    filename: String,
+    url: String,
+    #[serde(default)]
+    digests: Option<PypiDigests>,
+}
+
+#[derive(serde::Deserialize)]
+struct PypiDigests {
+    #[serde(default)]
+    sha256: Option<String>,
+}
+
+/// npm / PyPI 包页 → 直接查注册表，拿到 tarball / wheel 的直链
+fn package_files(page_url: &str) -> Option<Vec<(String, String, Option<String>)>> {
+    let rest = page_url.split("://").nth(1)?;
+    let (host, tail) = rest.split_once('/')?;
+    let path = tail.split(['?', '#']).next().unwrap_or(tail);
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let host = host.to_ascii_lowercase();
+
+    if host == "www.npmjs.com" || host == "npmjs.com" || host == "registry.npmjs.org" || host == "registry.npmmirror.com" {
+        // /package/<name> 或 /package/@scope/name；registry 上直接是 /<name>
+        let name = if segs.first() == Some(&"package") {
+            let rest = &segs[1..];
+            if rest.is_empty() {
+                return None;
+            }
+            if rest[0].starts_with('@') {
+                format!("{}/{}", rest[0], rest.get(1).copied().unwrap_or(""))
+            } else {
+                rest[0].to_string()
+            }
+        } else if !segs.is_empty() {
+            segs[0].to_string()
+        } else {
+            return None;
+        };
+        if name.is_empty() || name.ends_with('/') {
+            return None;
+        }
+        let client = http_client()?;
+        let enc = name.replace('/', "%2F");
+        for base in ["https://registry.npmmirror.com", "https://registry.npmjs.org"] {
+            let url = format!("{}/{}/latest", base, enc);
+            let Ok(resp) = client.get(&url).timeout(Duration::from_secs(8)).send() else {
+                continue;
+            };
+            if !resp.status().is_success() {
+                continue;
+            }
+            let Ok(v) = resp.json::<NpmLatest>() else {
+                continue;
+            };
+            let Some(tarball) = v.dist.map(|d| d.tarball) else {
+                continue;
+            };
+            return Some(vec![(
+                tarball,
+                format!("{}  {}", v.name, v.version),
+                None,
+            )]);
+        }
+        return None;
+    }
+
+    if host == "pypi.org" || host == "pypi.python.org" {
+        let name = match segs.first().copied() {
+            Some("project") => segs.get(1).copied()?,
+            Some("pypi") => segs.get(1).copied()?,
+            _ => return None,
+        };
+        let client = http_client()?;
+        let resp = client
+            .get(format!("https://pypi.org/pypi/{}/json", name))
+            .timeout(Duration::from_secs(8))
+            .send()
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let root: PypiRoot = resp.json().ok()?;
+        if root.urls.is_empty() {
+            return None;
+        }
+        let title_prefix = format!("{} {}", root.info.name, root.info.version);
+        return Some(
+            root.urls
+                .into_iter()
+                .map(|f| {
+                    let sha = f
+                        .digests
+                        .and_then(|d| d.sha256)
+                        .map(|s| s.to_ascii_lowercase())
+                        .filter(|s| s.len() == 64);
+                    (f.url, format!("{}  {}", title_prefix, f.filename), sha)
+                })
+                .collect(),
+        );
+    }
+
+    None
+}
+
 fn scan(shared: &ScanShared, page_url: &str, jar: &Path) -> Result<Vec<Candidate>, String> {
     // 媒体站（B站/YouTube…）交给 yt-dlp，不必解析页面
     if engine::classify(page_url).0 == engine::Kind::Media {
@@ -379,10 +645,37 @@ fn scan(shared: &ScanShared, page_url: &str, jar: &Path) -> Result<Vec<Candidate
     }
 
     let host0 = engine::url_host(page_url).unwrap_or_default();
+    let deadline = Instant::now() + SCAN_BUDGET;
+
+    // GitHub / npm / PyPI 直接走官方接口：比解析 HTML 快，还能带上官方哈希
+    if let Some(files) = (host0 == "github.com")
+        .then(|| github_release_files(page_url))
+        .flatten()
+        .or_else(|| package_files(page_url))
+    {
+        if !files.is_empty() {
+            set_msg(
+                shared,
+                format!("已从官方接口读取 {} 个文件", files.len()),
+            );
+            let raw: Vec<Raw> = files
+                .into_iter()
+                .enumerate()
+                .map(|(i, (url, title, sha))| Raw {
+                    url,
+                    title,
+                    page: page_url.to_string(),
+                    order: i as u32,
+                    sha256: sha,
+                })
+                .collect();
+            return Ok(probe_stream(shared, raw, None, jar, page_url));
+        }
+    }
+
     let mut level1: Vec<String> = vec![page_url.to_string()];
     let mut seen_pages: HashSet<String> = HashSet::new();
     let mut raw: Vec<Raw> = Vec::new();
-    let deadline = Instant::now() + SCAN_BUDGET;
 
     for depth in 0..2 {
         let mut next: Vec<String> = Vec::new();
@@ -675,6 +968,9 @@ fn probe_stream(
     let jar = jar.to_path_buf();
     let referer = referer.to_string();
     let workers = PROBE_WORKERS.min(total.load(Ordering::Relaxed).max(1));
+    // 整轮探测共用一个连接池；cookie 只读一次，避免每个候选都去读文件
+    let client = http_client();
+    let cookies = read_cookie_jar(jar.as_path());
 
     let mut handles = Vec::new();
     for _ in 0..workers {
@@ -687,6 +983,8 @@ fn probe_stream(
         let out = out.clone();
         let jar = jar.clone();
         let referer = referer.clone();
+        let client = client.clone();
+        let cookies = cookies.clone();
         let shared2 = shared.clone();
         handles.push(thread::spawn(move || loop {
             if cancelled(&shared2) {
@@ -694,7 +992,7 @@ fn probe_stream(
             }
             let item = queue.lock().unwrap().pop_front();
             if let Some(item) = item {
-                if let Some(c) = probe_one(&item, &jar, &referer) {
+                if let Some(c) = probe_one(&item, &jar, &cookies, &referer, client.as_ref()) {
                     out.lock().unwrap().push(c);
                 }
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -748,8 +1046,14 @@ fn probe_stream(
     by_url.into_values().collect()
 }
 
-fn probe_one(item: &Raw, jar: &Path, referer: &str) -> Option<Candidate> {
-    let info = head(item, jar, referer)?;
+fn probe_one(
+    item: &Raw,
+    jar: &Path,
+    cookies: &str,
+    referer: &str,
+    client: Option<&Client>,
+) -> Option<Candidate> {
+    let info = head(client, item, jar, cookies, referer)?;
     if matches!(info.status, 404 | 410) {
         return None;
     }
@@ -806,7 +1110,107 @@ fn probe_one(item: &Raw, jar: &Path, referer: &str) -> Option<Candidate> {
     })
 }
 
-fn head(item: &Raw, jar: &Path, referer: &str) -> Option<HeadInfo> {
+/// 探测用的进程内客户端：keep-alive 复用连接，避免每个候选都启动一次 curl。
+/// 解析阶段并发不高，HTTP/2 的多路复用反而更省握手。
+fn http_client() -> Option<Client> {
+    Client::builder()
+        .user_agent(UA)
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(15))
+        .pool_max_idle_per_host(PROBE_WORKERS + 8)
+        .tcp_nodelay(true)
+        .build()
+        .ok()
+}
+
+fn hdr(resp: &reqwest::blocking::Response, name: reqwest::header::HeaderName) -> String {
+    resp.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn total_from_range(v: &str) -> Option<u64> {
+    v.rsplit('/').next()?.trim().parse::<u64>().ok()
+}
+
+fn cd_name_resp(resp: &reqwest::blocking::Response) -> Option<String> {
+    let cd = hdr(resp, CONTENT_DISPOSITION);
+    cd.split(';').find_map(|seg| {
+        let seg = seg.trim();
+        seg.strip_prefix("filename=")
+            .map(|v| v.trim_matches('"').to_string())
+    })
+}
+
+/// 进程内 HEAD 探测；只有传输层失败才返回 None（交给 curl 兜底）
+fn head_http(client: &Client, item: &Raw, cookies: &str, referer: &str) -> Option<HeadInfo> {
+    let mut rb = client
+        .head(&item.url)
+        .header(ACCEPT, "*/*")
+        .header(REFERER, referer);
+    if !cookies.is_empty() {
+        rb = rb.header(COOKIE, cookies);
+    }
+    let resp = rb.send().ok()?;
+    let status = resp.status().as_u16();
+    let mut info = HeadInfo {
+        status,
+        final_url: resp.url().to_string(),
+        ctype: hdr(&resp, CONTENT_TYPE),
+        len: hdr(&resp, CONTENT_LENGTH).parse::<u64>().unwrap_or(0),
+        filename: cd_name_resp(&resp),
+    };
+
+    // HEAD 被拒、或没给长度/类型时，用 2 字节 Range 再探一次
+    if status >= 400 || info.len == 0 || info.ctype.is_empty() {
+        let mut rb = client
+            .get(&item.url)
+            .header(RANGE, "bytes=0-1")
+            .header(ACCEPT, "*/*")
+            .header(REFERER, referer);
+        if !cookies.is_empty() {
+            rb = rb.header(COOKIE, cookies);
+        }
+        if let Ok(r2) = rb.send() {
+            let st2 = r2.status().as_u16();
+            if info.status == 0 || info.status >= 400 {
+                info.status = st2;
+            }
+            if info.len == 0 {
+                info.len = total_from_range(&hdr(&r2, CONTENT_RANGE)).unwrap_or(0);
+            }
+            if info.ctype.is_empty() {
+                info.ctype = hdr(&r2, CONTENT_TYPE);
+            }
+            if info.filename.is_none() {
+                info.filename = cd_name_resp(&r2);
+            }
+            if info.final_url.is_empty() {
+                info.final_url = r2.url().to_string();
+            }
+        }
+    }
+    Some(info)
+}
+
+fn head(
+    client: Option<&Client>,
+    item: &Raw,
+    jar: &Path,
+    cookies: &str,
+    referer: &str,
+) -> Option<HeadInfo> {
+    if let Some(c) = client {
+        if let Some(info) = head_http(c, item, cookies, referer) {
+            return Some(info);
+        }
+    }
+    head_curl(item, jar, referer)
+}
+
+fn head_curl(item: &Raw, jar: &Path, referer: &str) -> Option<HeadInfo> {
     let a: Vec<String> = vec![
         "-sS".into(),
         "-I".into(),

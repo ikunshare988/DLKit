@@ -21,17 +21,34 @@ jobs:
         with:
           workspaces: ui
 
-      - name: 编译
+      - name: 编译轻量版
         working-directory: ui
         run: cargo build --release --locked
 
-      - name: 打包并计算校验值
+      - name: 暂存轻量版
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item ui\target\release\dlkit.exe dist\DLKit.exe
-          $hash = (Get-FileHash dist\DLKit.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  DLKit.exe" | Set-Content -Encoding ascii dist\SHA256.txt
+
+      - name: 编译增强版
+        working-directory: ui
+        run: cargo build --release --features enhanced --locked
+
+      - name: 暂存增强版
+        shell: pwsh
+        run: |
+          Copy-Item ui\target\release\dlkit.exe dist\DLKit-enhanced.exe
+
+      - name: 计算校验值
+        shell: pwsh
+        run: |
+          $lines = @()
+          foreach ($n in @("DLKit.exe", "DLKit-enhanced.exe")) {
+            $h = (Get-FileHash "dist\$n" -Algorithm SHA256).Hash.ToLower()
+            $lines += "$h  $n"
+          }
+          $lines | Set-Content -Encoding ascii dist\SHA256.txt
           Get-Content dist\SHA256.txt
 
       - name: 安装 cosign
@@ -42,6 +59,7 @@ jobs:
         run: |
           # 证书里会记录本仓库、本工作流和 tag，任何人都能离线验证签名来源
           cosign sign-blob --yes --bundle dist\DLKit.exe.bundle dist\DLKit.exe
+          cosign sign-blob --yes --bundle dist\DLKit-enhanced.exe.bundle dist\DLKit-enhanced.exe
           Get-ChildItem dist
 
       - name: 创建 Release
@@ -49,6 +67,8 @@ jobs:
         with:
           files: |
             dist/DLKit.exe
+            dist/DLKit-enhanced.exe
             dist/SHA256.txt
             dist/DLKit.exe.bundle
+            dist/DLKit-enhanced.exe.bundle
           generate_release_notes: true

@@ -14,11 +14,16 @@ What it is for:
 
 ## Download
 
-Get `DLKit.exe` from [Releases](https://github.com/ikunshare988/DLKit/releases) and put it in any folder.
+Get the build you need from [Releases](https://github.com/ikunshare988/DLKit/releases) and unzip it anywhere:
+
+- `DLKit.exe` — Lite, for short downloads and everyday use
+- `DLKit-enhanced.exe` — Enhanced, adding policy configuration, post-download security checks, cloud reputation and sandboxing
+
+Both share the same core (pooled connections, splitting, faster scanning, link tracking); only the enhanced-only capabilities differ — see [Two editions](#two-editions).
 
 The exe is not code-signed, so Windows SmartScreen may warn on first launch — choose "More info → Run anyway". Every release ships a `SHA256.txt` you can verify.
 
-Each release also ships `DLKit.exe.bundle`, a keyless Sigstore signature produced in GitHub Actions. The certificate records this repository, workflow and tag. With [cosign](https://docs.sigstore.dev/cosign/installation/) installed:
+Each release also ships `DLKit.exe.bundle` and `DLKit-enhanced.exe.bundle`, keyless Sigstore signatures produced in GitHub Actions. The certificate records this repository, workflow and tag. With [cosign](https://docs.sigstore.dev/cosign/installation/) installed:
 
 ```powershell
 cosign verify-blob --bundle DLKit.exe.bundle `
@@ -29,7 +34,9 @@ cosign verify-blob --bundle DLKit.exe.bundle `
 
 ## Setup
 
-The binary is a single exe, but downloading relies on a few command-line tools. Put them next to it:
+The simplest path: drop `DLKit.exe` into any writable folder (Desktop, `D:\DLKit`) and double-click it. The first launch creates `config/`, `logs/` and `aria2.conf` with a random `rpc-secret`; downloads go to your system Downloads folder by default.
+
+Direct downloads only need the system `curl`. The command-line tools used by torrents and video sites can be installed from Settings → Dependencies, or with the one-click banner shown on first use:
 
 ```
 DLKit.exe
@@ -40,22 +47,14 @@ bin/
   ffmpeg/bin/ffprobe.exe
   openlist/openlist.exe      # optional, cloud drives only
 config/
-  aria2.conf
+  aria2.conf                 # generated on first launch
   openlist.json              # optional
-downloads/
+logs/
 ```
 
-Anything missing can be installed with one click from Settings → Dependencies; the app downloads aria2 / yt-dlp / ffmpeg into `bin/` itself and needs no extra runtime.
-
-Configuration:
-
-1. Copy `config/aria2.conf.example` to `config/aria2.conf` and set `rpc-secret` (paths are relative, so the folder is portable across drives and machines)
-2. For cloud drives, copy `config/openlist.json.example` to `config/openlist.json` and fill in your OpenList address and account
-
-Start:
-
-- Direct links and page scanning: just run `DLKit.exe`
-- Torrents, cloud drives or aria2 fallback: run `start.ps1` first, then open the app
+- Adding a magnet link auto-installs aria2 if needed and starts the service once it is ready
+- The full package (with `start.ps1`) also starts OpenList; an exe-only install launches aria2c directly
+- For cloud drives, copy `config/openlist.json.example` to `config/openlist.json` and fill in your OpenList address and account
 
 ## Features
 
@@ -80,10 +79,14 @@ Start:
 
 ### Download-page scanning
 
+- Probing uses an in-process keep-alive pool instead of spawning curl per candidate; 40 candidates resolve in ~0.15s locally
+- GitHub repository / release pages are read through the official API (assets, sizes, digests), falling back to HTML when the API is unavailable
+- npm package pages go through the registry (npmmirror first) for the tarball; PyPI project pages use `pypi.org/pypi/<name>/json` and list wheels / sdists with their official SHA256
+- Re-scanning the same page within 10 minutes reuses the cached result, including Referer / Cookie
 - Paste a download page (not a direct link) and hit "Scan page"
 - Extracts links from `a`, `video/audio/source`, `iframe`, `meta og:video`, `link rel=enclosure`, plus URLs embedded in inline JSON
 - Sends a HEAD request per candidate, follows redirects, and reads the real name, size and type
-- Up to 24 probes run concurrently and the manifest is fetched in parallel; a page with 40+ candidates usually resolves in 5–6 seconds
+- Up to 24 probes run concurrently and the manifest is fetched in parallel; a page with 40+ candidates usually resolves in 1–3 seconds, depending on round-trip time
 - Follows one more level of same-origin download pages
 - When the page is rendered by JavaScript (nodejs.org only exposes the source tarball), it also reads the directory's checksum manifest (`SHASUMS256.txt` and friends) to list every artifact, including `.zip` / `.msi`; the manifest is fetched in parallel with probing
 - SHA256 values from the manifest are carried along (marked `SHA256`) and verified after the download; a mismatch fails the task and reports both hashes
@@ -143,11 +146,54 @@ A rule means: when a URL starts with `from`, also try the same URL with that pre
 
 ### Background and updates
 
-- The UI is split into Download and Settings pages: the download page only handles links and tasks
+- The UI has four pages — Download, Tracking, Accounts and Settings; the download page only handles links and tasks
 - Closing the window does not quit: the app stays in the system tray and downloads keep running
 - Hover the tray icon for task count and current speed; click to restore the window, right-click for "Show window" / "Quit DLKit"
 - GitHub Releases are checked on startup; a new version shows a banner with download, SHA256 verification and restart-to-install, or you can pick "Later"
 - The "Check updates" button in the header triggers a manual check
+
+### First run and self-service
+
+- The first launch lists missing components and installs them all with one click; direct downloads need none of them
+- Downloads default to your system Downloads folder
+- Failed tasks offer a next step instead of a bare error: 403/401 → Accounts, not enough disk → Settings, aria2 offline → Start service, plus "Copy error"
+- Settings → Environment check verifies writable folder, config, download folder and free space, the three tools, aria2, and network, with a one-line verdict and a copyable report
+- If DLKit sits in a read-only folder such as `Program Files`, the app says so at the top and offers to open the folder
+- Crashes are written to `logs\crash-*.log`; the next launch offers to view or dismiss them
+
+### Policy and resource allocation
+
+Copy `config/policy.example.json` to `config/policy.json`; reload it from Settings → Policy:
+
+- `profiles`: override concurrency (`conn`), per-task bandwidth (`limit_mbps`) and queue priority (`high` / `normal` / `low`) by host or kind
+- `budget.max_connections`: shared ceiling across tasks; profile values are capped by it
+- `budget.max_active_tasks`: concurrent task limit; extra tasks queue and take freed slots by priority
+- `schedule`: time-of-day limits, midnight-crossing supported (`23:00`–`07:00`); an active slot overrides the global limit and restores it afterwards
+- A malformed file never blocks startup: Settings shows the line number and the defaults stay active
+
+### Security (enhanced)
+
+- Executables, archives and documents are checked after download; video, images and audio are skipped
+- Three layers: filename/header heuristics (double extensions, RLO spoofing, content/extension mismatch, macro documents), embedded Authenticode signature, and a Windows Defender single-file scan
+- Optional cloud reputation: VirusTotal v3 by SHA256 only — the file is never uploaded; the API key lives in `config/security.json` and the feature is off by default
+- Sandbox mode: downloads land in `<download dir>\.dlkit-sandbox` and are released automatically once they pass; risky or unchecked files stay there until you release them from the task card
+- Defender runs at idle priority and only detects (`-DisableRemediation`) — nothing is ever deleted for you
+- Verdicts are phrased as "no threats found / suspicious traits / risk found / check incomplete"
+- On risk you can quarantine or keep the file; quarantining moves it into `quarantine/` with a JSON record so it can be restored
+- Files above the size limit (4GB by default) skip Defender and get heuristics plus signature checks only
+- If Defender is disabled by policy or another AV, the report says the check was incomplete rather than claiming safety
+- Check a single file manually: `DLKit.exe --av-scan "D:\path\file.exe"`
+
+### Link tracking
+
+- Any direct link can be tracked: while the app sits in the tray it polls in the background and shows a Windows notification when the file changes
+- Every 2 minutes by default; all entries are checked once whenever the app starts
+- Notification only — nothing is downloaded until you press "Download" on the Tracking page (or in the toast's target folder)
+- Checks use conditional requests (`If-None-Match` / `If-Modified-Since`); a 304 means no body is transferred
+- Change signals in order: `ETag` → file size → final URL after redirects (so `releases/latest`-style links reveal the version in the path). A `Last-Modified` or filename change alone is a weak signal and has to occur twice, which keeps CDN jitter from raising false alarms
+- Query strings are stripped before comparison, so pre-signed links do not look new on every poll
+- 404/410 marks the entry as gone and drops to hourly checks; failures back off 1→2→4… minutes, up to 32
+- The list lives in `config/watches.json` and can be edited or backed up directly
 
 ### While downloading
 
@@ -164,6 +210,86 @@ DLKit.exe --headless "https://example.com/file.zip" -c 32 -d "D:\Downloads"
 # Scan a download page and list candidates
 DLKit.exe --scan "https://www.7-zip.org/download.html"
 ```
+
+## Two editions
+
+One codebase, two builds:
+
+| | Lite (default) | Enhanced (`--features enhanced`) |
+| --- | --- | --- |
+| Direct links / torrents / video sites / cloud drives | yes | yes |
+| Pooled connections, byte-level splitting, standby lanes | yes | yes |
+| Faster scanning, GitHub API, cache | yes | yes |
+| Throughput-weighted source selection | yes | yes |
+| Link tracking | yes | yes |
+| Policy (per-host concurrency, budget, time-of-day limits) | — | yes |
+| Post-download security scan (heuristics / signature / Defender / quarantine) | — | yes |
+
+```powershell
+cd ui
+cargo build --release                    # lite
+cargo build --release --features enhanced  # enhanced
+```
+
+## Benchmarks
+
+Use the built-in benchmark commands instead of guessing whether a change helped:
+
+```powershell
+# Downloads: time, average/peak speed, time to first byte, tail time
+DLKit.exe --bench "https://example.com/file.zip" -c 32 --repeat 3
+
+# Scanning: elapsed time and candidate count
+DLKit.exe --bench-scan "https://www.7-zip.org/download.html" --repeat 3
+```
+
+A reproducible local target (per-connection rate limit, Range/ETag, `/bump` to change the version):
+
+```powershell
+python tools/bench_server.py --port 8907 --rate-mbps 4 --latency-ms 20
+```
+
+## MCP (for AI clients)
+
+The same exe can run as an MCP server, handing the downloader directly to AI clients (Trae, Claude Desktop, Cursor and others):
+
+```powershell
+DLKit.exe --mcp
+```
+
+It speaks JSON-RPC over stdin/stdout, one message per line. No Python, Node or extra service is needed, and the normal GUI still works by double-clicking the exe.
+
+Add this to your client's MCP configuration (point the path at your exe):
+
+```json
+{
+  "mcpServers": {
+    "dlkit": {
+      "command": "D:\\DLKit\\DLKit.exe",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+You can then say "download the Windows build from this page and verify its SHA256" and the client will compose the tools itself:
+
+| Tool | Purpose |
+| --- | --- |
+| `scan_page` | Scan a download page; returns files, sizes, types, official SHA256, and the build recommended for this machine |
+| `download` | Start a direct link / magnet / media page / `openlist:` path, returns a `task_id` immediately |
+| `download_from_page` | One step: scan → pick by `index` or the recommendation → start downloading |
+| `task_status` | Status, percent, speed, output path and recent log lines for one task |
+| `list_tasks` | All tasks in this process |
+| `cancel_task` | Cancel a task (written bytes are kept and resumable) |
+| `verify_file` | Compute a local file's SHA256, optionally against an expected value |
+
+Notes:
+
+- Tasks live inside the MCP process; quitting it stops them. Use the GUI for long background downloads
+- Output directory and default concurrency come from the Settings page (`config/ui.json`)
+- Tool failures return `isError: true` instead of breaking the session
+- For large files, take the `task_id` and poll instead of one long `wait_seconds`
 
 ## Build
 
@@ -186,10 +312,16 @@ ui/src/engine.rs    download engine (pooled blocks, mirrors, aria2, yt-dlp, Open
 ui/src/scanner.rs   download-page scanning (fetch, extract, probe)
 ui/src/platform.rs  picks the download matching the current OS
 ui/src/accounts.rs  accounts (DPAPI-encrypted Bilibili cookie, OpenList credentials)
+ui/src/policy.rs    policy (per-host concurrency, budget, time-of-day limits)
 ui/src/deps.rs      dependency check and one-click install
+ui/src/mcp.rs       MCP server (lets AI clients drive downloads)
+ui/src/watch.rs     link tracking (polls direct links and notifies on change)
+ui/src/setup.rs     first-run setup (folders, config, crash log)
+ui/src/diag.rs      environment checks and report
 ui/src/tray.rs      system tray (stay in background)
 ui/src/update.rs    auto-update (check, download, verify, restart)
 start.ps1           starts aria2 and OpenList
+tools/bench_server.py  reproducible throttled test server
 config/             configuration files and examples
 ```
 

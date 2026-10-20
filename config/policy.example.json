@@ -1,0 +1,29 @@
+{
+  "budget": {
+    "max_connections": 96,
+    "max_active_tasks": 3
+  },
+  "schedule": [
+    { "from": "09:00", "to": "23:00", "limit_mbps": 10 }
+  ],
+  "profiles": [
+    {
+      "name": "GitHub 发布包",
+      "match_hosts": ["github.com", "objects.githubusercontent.com"],
+      "conn": 64,
+      "priority": "high"
+    },
+    {
+      "name": "网盘直链",
+      "match_hosts": ["pan.baidu.com", "aliyundrive.com", "pan.quark.cn"],
+      "conn": 8,
+      "limit_mbps": 20,
+      "priority": "low"
+    },
+    {
+      "name": "BT",
+      "match_kinds": ["torrent"],
+      "conn": 16
+    }
+  ]
+}
