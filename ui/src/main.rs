@@ -186,6 +186,7 @@ enum CardAction {
     Quarantine(PathBuf),
     AcceptAv(PathBuf),
     Release(PathBuf),
+    Notice(String),
 }
 
 struct App {
@@ -693,9 +694,9 @@ impl App {
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 if ui.button("打开目录").clicked() {
-                                    let _ = std::process::Command::new("explorer")
-                                        .arg(&self.root)
-                                        .spawn();
+                                    if let Err(e) = open_path(&self.root) {
+                                        self.notify(e);
+                                    }
                                 }
                             },
                         );
@@ -1263,7 +1264,9 @@ impl App {
                             if ui.button("打开隔离目录").clicked() {
                                 let dir = av::quarantine_dir(&self.root);
                                 let _ = std::fs::create_dir_all(&dir);
-                                let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                                if let Err(e) = open_path(&dir) {
+                                    self.notify(e);
+                                }
                             }
                             if ui.button("立即检查已下载文件").clicked() {
                                 self.av_scanned.clear();
@@ -2548,9 +2551,9 @@ impl eframe::App for App {
                             self.notify("正在检查更新…");
                         }
                         if ui.button("打开下载目录").clicked() {
-                            let _ = std::process::Command::new("explorer")
-                                .arg(&self.cfg.dir)
-                                .spawn();
+                            if let Err(e) = open_path(&self.cfg.dir) {
+                                self.notify(e);
+                            }
                         }
                         if ui.button("全部清空已完成").clicked() {
                             self.tasks.retain(|t| {
@@ -2860,9 +2863,26 @@ impl eframe::App for App {
                                             Status::Failed => ("失败", DANGER, DANGER_BG),
                                             Status::Cancelled => ("已取消", MUTED, PANEL),
                                         };
-                                        ui.label(
-                                            RichText::new(&snap.name).strong().size(14.5).color(TEXT),
+                                        let name = ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&snap.name)
+                                                    .strong()
+                                                    .size(14.5)
+                                                    .color(TEXT),
+                                            )
+                                            .sense(egui::Sense::click()),
                                         );
+                                        if name.double_clicked() && snap.status == Status::Done {
+                                            if let Some(out) = &snap.output {
+                                                if let Err(e) = open_path(out) {
+                                                    card_action =
+                                                        Some(CardAction::Notice(e));
+                                                }
+                                            }
+                                        }
+                                        if name.hovered() && snap.status == Status::Done {
+                                            name.on_hover_text("双击打开文件");
+                                        }
                                         pill(ui, snap.kind.label(), SECONDARY, BUBBLE);
                                         pill(ui, tag, fg, bg);
 
@@ -2893,19 +2913,26 @@ impl eframe::App for App {
                                                 if snap.status == Status::Done {
                                                     if let Some(out) = &snap.output {
                                                         if ui.button("打开文件").clicked() {
-                                                            let _ = std::process::Command::new(
-                                                                "explorer",
-                                                            )
-                                                            .arg(out)
-                                                            .spawn();
+                                                            if let Err(e) = open_path(out) {
+                                                                card_action = Some(
+                                                                    CardAction::Notice(e),
+                                                                );
+                                                            }
                                                         }
                                                     }
                                                     if ui.button("打开目录").clicked() {
-                                                        let _ = std::process::Command::new(
-                                                            "explorer",
-                                                        )
-                                                        .arg(&self.cfg.dir)
-                                                        .spawn();
+                                                        let dir = snap
+                                                            .output
+                                                            .as_ref()
+                                                            .and_then(|p| p.parent())
+                                                            .map(|p| p.to_path_buf())
+                                                            .unwrap_or_else(|| {
+                                                                self.cfg.dir.clone()
+                                                            });
+                                                        if let Err(e) = open_path(&dir) {
+                                                            card_action =
+                                                                Some(CardAction::Notice(e));
+                                                        }
                                                     }
                                                 }
                                             },
@@ -3172,6 +3199,7 @@ impl eframe::App for App {
                             Err(e) => self.notify(e),
                         }
                     }
+                    Some(CardAction::Notice(m)) => self.notify(m),
                     None => {}
                 }
                 self.selected = selected_now.min(self.tasks.len().saturating_sub(1));
@@ -3500,8 +3528,81 @@ fn av_scan_cmd() -> i32 {
     0
 }
 
+/// 用系统外壳打开文件/目录。
+/// 不用 `Command::new("explorer")`：程序以管理员身份运行时，explorer 的 DDE 请求
+/// 会被已有的资源管理器实例忽略，表现为「点了没反应」。ShellExecuteW 交给外壳处理，
+/// 两种情况都能正常打开，失败时还能拿到错误码。
+#[cfg(windows)]
+fn shell_exec(path: &std::path::Path, params: Option<&str>) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: isize,
+            op: *const u16,
+            file: *const u16,
+            params: *const u16,
+            dir: *const u16,
+            show: i32,
+        ) -> isize;
+    }
+    let wide = |s: &std::ffi::OsStr| -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    };
+    let file = wide(path.as_os_str());
+    let op = wide(std::ffi::OsStr::new("open"));
+    let par = params.map(|p| wide(std::ffi::OsStr::new(p)));
+    let rc = unsafe {
+        ShellExecuteW(
+            0,
+            op.as_ptr(),
+            file.as_ptr(),
+            par.as_ref().map(|v| v.as_ptr()).unwrap_or(std::ptr::null()),
+            std::ptr::null(),
+            1,
+        )
+    };
+    if rc > 32 {
+        Ok(())
+    } else {
+        Err(format!("系统无法打开：{}（错误码 {}）", path.display(), rc))
+    }
+}
+
+#[cfg(not(windows))]
+fn shell_exec(path: &std::path::Path, _params: Option<&str>) -> Result<(), String> {
+    std::process::Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn open_path(path: &std::path::Path) -> Result<(), String> {
+    shell_exec(path, None)
+}
+
+/// 打开所在文件夹并选中该文件
+fn reveal_path(path: &std::path::Path) -> Result<(), String> {
+    let params = format!("/select,\"{}\"", path.display());
+    shell_exec(std::path::Path::new("explorer.exe"), Some(&params))
+}
+
 fn main() -> eframe::Result {
     setup::install_panic_hook();
+    if std::env::args().nth(1).as_deref() == Some("--open") {
+        let p = std::env::args().nth(2).unwrap_or_default();
+        match open_path(std::path::Path::new(&p)) {
+            Ok(_) => {
+                println!("ok");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                println!("{}", e);
+                std::process::exit(1);
+            }
+        }
+    }
     if std::env::args().nth(1).as_deref() == Some("--av-scan") {
         std::process::exit(av_scan_cmd());
     }
