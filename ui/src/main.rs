@@ -103,7 +103,7 @@ fn load_config() -> Config {
                 cfg.dir = PathBuf::from(d);
             }
             if let Some(c) = raw.conn {
-                cfg.conn = c.clamp(1, 64);
+                cfg.conn = c.clamp(1, 128);
             }
             if let Some(e) = raw.engine {
                 cfg.engine = e;
@@ -498,7 +498,7 @@ impl App {
                                 if ui
                                     .add(
                                         egui::DragValue::new(&mut self.cfg.conn)
-                                            .range(1..=64)
+                                            .range(1..=128)
                                             .suffix(" 路"),
                                     )
                                     .changed()

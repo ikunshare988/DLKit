@@ -61,8 +61,9 @@ Start:
 
 ### Direct downloads
 
-- Files are split into blocks and fetched concurrently (default 32 connections, 1–64 in the UI)
-- A persistent connection pool (keep-alive, HTTP/2 when the server supports it) reuses connections instead of restarting a client per block
+- Files are split into blocks fetched in parallel (32 by default, 1–128 in the UI)
+- On fast links, raising concurrency to 64–128 keeps adding bandwidth: each connection gets its own block over HTTP/1.1, so HTTP/2 cannot funnel dozens of streams into one congestion window
+- A persistent connection pool (keep-alive) reuses connections instead of restarting a client per block
 - Blocks are split at byte level on the fly: a slow stream only hands over its unfinished half, already written bytes are never re-downloaded
 - 25% standby connections (e.g. 80 for 64 lanes) take over as soon as one stream falls below the median or overall speed drops under 60% of peak
 - Space is preallocated and every block is written straight to its offset — no temp files, no merge step

@@ -1998,6 +1998,7 @@ pub fn run_fast(
 //   2. 段内可按字节切分：慢连接只交出「还没下的那半段」，已写字节不重下；
 //   3. 预留 1.25× 的连接，速度掉下来时备用连接立即接手（不用等握手）。
 
+const POOL_BOOT: u64 = 1 << 20;
 const POOL_MIN_SEG: u64 = 1 << 20;
 const POOL_MAX_SEG: u64 = 8 << 20;
 const POOL_UNIT_LIMIT: u64 = 262_144;
@@ -2020,6 +2021,9 @@ fn pool_unit(size: u64) -> u64 {
 
 fn pool_client(conns: usize) -> Result<reqwest::blocking::Client, EngErr> {
     reqwest::blocking::Client::builder()
+        // 批量下载靠「多条独立 TCP」叠加带宽；HTTP/2 会把几十条流塞进一条连接，
+        // 在高速链路上反而受单连接拥塞窗口限制，所以这里固定用 HTTP/1.1
+        .http1_only()
         .pool_max_idle_per_host(conns.max(1) + 8)
         .pool_idle_timeout(Duration::from_secs(90))
         .tcp_nodelay(true)
@@ -2399,8 +2403,9 @@ pub fn run_pool(
         .and_then(|s| serde_json::from_str::<State>(&s).ok())
         .unwrap_or_default();
 
-    // 首段请求：同时完成「探测大小」和「下载第一段」，不给握手多付一次时间
-    let mut resp = pool_request(&client, url, headers, 0, POOL_MAX_SEG - 1)
+    // 首段请求：同时完成「探测大小」和「下载第一段」，不给握手多付一次时间。
+    // 只用 1MB：太大会让首条连接独占大块，后面的 worker 分不到活，反而拖慢峰值。
+    let mut resp = pool_request(&client, url, headers, 0, POOL_BOOT - 1)
         .send()
         .map_err(|e| EngErr::Soft(format!("连接失败：{}", err_chain(&e))))?;
     let code = resp.status().as_u16();
@@ -2416,6 +2421,11 @@ pub fn run_pool(
     }
     let final_url = resp.url().to_string();
     let head = resp.headers().clone();
+    let http_ver = if resp.version() == reqwest::Version::HTTP_2 {
+        "h2"
+    } else {
+        "h1.1"
+    };
     let ranges = code == 206;
     let size = if ranges {
         head.get(CONTENT_RANGE)
@@ -2537,7 +2547,7 @@ pub fn run_pool(
         .collect();
     let counter = Arc::new(AtomicU64::new(base));
 
-    let boot_end = (POOL_MAX_SEG - 1).min(size - 1);
+    let boot_end = (POOL_BOOT - 1).min(size - 1);
     let boot_done = (0..=boot_end / unit).all(|u| done.contains(&(u * unit)));
     let mut queue = build_ranges(size, unit, seg, &done);
     if !boot_done {
@@ -2584,11 +2594,12 @@ pub fn run_pool(
     log_line(
         &task,
         format!(
-            "{} 个分块 × {:.2} MB，连接池 {} + 备用 {}",
+            "{} 个分块 × {:.2} MB，连接池 {} + 备用 {}，{}",
             queue.len() + if boot_done { 0 } else { 1 },
             seg as f64 / 1048576.0,
             conn,
-            extra
+            extra,
+            http_ver
         ),
     );
 
