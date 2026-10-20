@@ -8,7 +8,8 @@
 use crate::engine;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,7 +19,9 @@ const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
 const MAX_HTML: usize = 4 << 20;
 const MAX_LEVEL1_PAGES: usize = 8;
 const MAX_CANDIDATES: usize = 120;
-const PROBE_WORKERS: usize = 8;
+/// 并发探测数。每个候选要独立走一次 DNS/TLS，8 路时 40+ 个候选要排 5 轮以上，
+/// 提到 24 路后探测阶段能压到 2 轮左右。HEAD 请求很轻，站点一般不会因此限流。
+const PROBE_WORKERS: usize = 24;
 const SCAN_BUDGET: Duration = Duration::from_secs(45);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -40,6 +43,8 @@ pub struct Candidate {
     pub checked: bool,
     /// 页面中的出现顺序，用于保持「最新版本在前」的直觉排序
     pub order: u32,
+    /// 官方清单里给出的 SHA256（十六进制小写），下载完成后用于校验
+    pub sha256: Option<String>,
 }
 
 pub struct ScanState {
@@ -347,11 +352,13 @@ fn read_cookie_jar(path: &Path) -> String {
 
 // ---------------- 主流程 ----------------
 
+#[derive(Clone)]
 struct Raw {
     url: String,
     title: String,
     page: String,
     order: u32,
+    sha256: Option<String>,
 }
 
 fn scan(shared: &ScanShared, page_url: &str, jar: &Path) -> Result<Vec<Candidate>, String> {
@@ -367,6 +374,7 @@ fn scan(shared: &ScanShared, page_url: &str, jar: &Path) -> Result<Vec<Candidate
             note: "交给 yt-dlp 解析格式".into(),
             checked: true,
             order: 0,
+            sha256: None,
         }]);
     }
 
@@ -414,6 +422,7 @@ fn scan(shared: &ScanShared, page_url: &str, jar: &Path) -> Result<Vec<Candidate
                     title: String::new(),
                     page: url.clone(),
                     order,
+                    sha256: None,
                 });
                 continue;
             }
@@ -434,6 +443,7 @@ fn scan(shared: &ScanShared, page_url: &str, jar: &Path) -> Result<Vec<Candidate
                         title: link.text,
                         page: page.final_url.clone(),
                         order,
+                        sha256: None,
                     });
                 } else if depth == 0
                     && next.len() < MAX_LEVEL1_PAGES
@@ -466,15 +476,34 @@ fn scan(shared: &ScanShared, page_url: &str, jar: &Path) -> Result<Vec<Candidate
             is_file_ext(&e) || is_media_ext(&e)
         })
         .count();
-    if file_count > 0 && file_count <= 6 && Instant::now() < deadline {
-        add_manifest_links(shared, &mut raw, jar, deadline);
-    }
     if raw.is_empty() {
         return Ok(Vec::new());
     }
 
-    set_msg(shared, format!("发现 {} 个链接，正在探测文件信息…", raw.len()));
-    Ok(probe_all(shared, raw, jar, page_url))
+    // 清单抓取与探测并行：探测一开始就能用页面里已有的链接，不必等清单回来。
+    // 清单通常还要单独握手一次（0.5–1s），并行后这段时间基本被吃掉。
+    let want_manifest = file_count > 0 && file_count <= 6 && Instant::now() < deadline;
+    if want_manifest {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base = raw.clone();
+        let shared2 = shared.clone();
+        let jar2 = jar.to_path_buf();
+        thread::spawn(move || {
+            let extra = manifest_raws(&shared2, &base, &jar2, deadline);
+            let _ = tx.send(extra);
+        });
+        set_msg(
+            shared,
+            format!("发现 {} 个链接，正在探测文件信息…", raw.len()),
+        );
+        Ok(probe_stream(shared, raw, Some(rx), jar, page_url))
+    } else {
+        set_msg(
+            shared,
+            format!("发现 {} 个链接，正在探测文件信息…", raw.len()),
+        );
+        Ok(probe_stream(shared, raw, None, jar, page_url))
+    }
 }
 
 /// 发布清单里常见的文件名
@@ -491,9 +520,9 @@ fn dir_of(url: &str) -> Option<String> {
     Some(p[..i + 1].to_string())
 }
 
-/// 解析「校验和 + 文件名」清单（sha256sum 格式），返回其中的文件名
-fn parse_manifest(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+/// 解析「校验和 + 文件名」清单（sha256sum 格式）
+fn parse_manifest(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -501,7 +530,7 @@ fn parse_manifest(text: &str) -> Vec<String> {
         }
         let mut it = line.split_whitespace();
         let hash = it.next().unwrap_or("");
-        if hash.len() < 32 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
             continue;
         }
         let name = it.last().unwrap_or("").trim_start_matches('*');
@@ -512,8 +541,8 @@ fn parse_manifest(text: &str) -> Vec<String> {
         if ext_of(name).is_empty() {
             continue;
         }
-        if !out.iter().any(|x| x == name) {
-            out.push(name.to_string());
+        if !out.iter().any(|(n, _)| n == name) {
+            out.push((name.to_string(), hash.to_ascii_lowercase()));
         }
         if out.len() >= MAX_MANIFEST_FILES {
             break;
@@ -522,10 +551,17 @@ fn parse_manifest(text: &str) -> Vec<String> {
     out
 }
 
-fn add_manifest_links(shared: &ScanShared, raw: &mut Vec<Raw>, jar: &Path, deadline: Instant) {
+/// 抓取发布清单，返回清单里列出的文件（带 SHA256）。
+/// 不修改已有列表，由调用方在探测过程中合并。
+fn manifest_raws(
+    shared: &ScanShared,
+    base: &[Raw],
+    jar: &Path,
+    deadline: Instant,
+) -> Vec<Raw> {
     let mut dirs: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for r in raw.iter() {
+    for r in base.iter() {
         let e = ext_of(&r.url);
         if !is_file_ext(&e) && !is_media_ext(&e) {
             continue;
@@ -536,10 +572,11 @@ fn add_manifest_links(shared: &ScanShared, raw: &mut Vec<Raw>, jar: &Path, deadl
             }
         }
     }
+    let mut out: Vec<Raw> = Vec::new();
     for dir in dirs {
         for name in MANIFEST_NAMES {
             if Instant::now() > deadline || cancelled(shared) {
-                return;
+                return out;
             }
             let page = match fetch_page(&format!("{}{}", dir, name), jar) {
                 Ok(p) => p,
@@ -548,37 +585,35 @@ fn add_manifest_links(shared: &ScanShared, raw: &mut Vec<Raw>, jar: &Path, deadl
             if page.content_type.contains("html") {
                 continue;
             }
-            let names = parse_manifest(&page.html);
-            if names.is_empty() {
+            let entries = parse_manifest(&page.html);
+            if entries.is_empty() {
                 continue;
             }
-            let mut order = raw.iter().map(|r| r.order).max().unwrap_or(0) + 1;
-            let before = raw.len();
-            for n in names {
+            let mut order = base.iter().map(|r| r.order).max().unwrap_or(0) + 1;
+            for (n, hash) in entries {
                 let u = format!("{}{}", dir, n);
-                if let Some(old) = raw.iter_mut().find(|r| r.url == u) {
-                    // 清单里的文件名才是权威名称，页面上的按钮文字常常是占位符
-                    old.title = n;
+                if out.iter().any(|r| r.url == u) {
                     continue;
                 }
-                raw.push(Raw {
+                out.push(Raw {
                     url: u,
                     title: n,
                     page: dir.clone(),
                     order,
+                    sha256: Some(hash),
                 });
                 order += 1;
             }
-            let added = raw.len() - before;
-            if added > 0 {
+            if !out.is_empty() {
                 set_msg(
                     shared,
-                    format!("页面是动态渲染的，从发布清单补充了 {} 个文件", added),
+                    format!("从发布清单补充了 {} 个文件，继续探测…", out.len()),
                 );
             }
             break;
         }
     }
+    out
 }
 
 fn short_url(u: &str) -> String {
@@ -600,55 +635,104 @@ struct HeadInfo {
     filename: Option<String>,
 }
 
-fn probe_all(shared: &ScanShared, raw: Vec<Raw>, jar: &Path, referer: &str) -> Vec<Candidate> {
-    // 先按 URL 去重
-    let mut seen = HashSet::new();
-    let mut list: VecDeque<Raw> = VecDeque::new();
-    for r in raw {
+/// 把新发现的链接并入探测队列；按 URL 去重，并同步总数
+fn enqueue(
+    queue: &Mutex<VecDeque<Raw>>,
+    seen: &Mutex<HashSet<String>>,
+    total: &AtomicUsize,
+    items: Vec<Raw>,
+) {
+    let mut seen = seen.lock().unwrap();
+    let mut q = queue.lock().unwrap();
+    let mut n = 0;
+    for r in items {
         let key = r.url.split('#').next().unwrap_or(&r.url).to_string();
         if seen.insert(key) {
-            list.push_back(r);
+            q.push_back(r);
+            n += 1;
         }
     }
-    let total = list.len();
-    let queue = Arc::new(Mutex::new(list));
+    total.fetch_add(n, Ordering::Relaxed);
+}
+
+/// 流式探测：边探测边接收后续补充的链接（发布清单），不必等清单抓完再开工。
+fn probe_stream(
+    shared: &ScanShared,
+    initial: Vec<Raw>,
+    extra: Option<Receiver<Vec<Raw>>>,
+    jar: &Path,
+    referer: &str,
+) -> Vec<Candidate> {
+    let queue: Arc<Mutex<VecDeque<Raw>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let total = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(AtomicBool::new(extra.is_none()));
+    let rx = extra.map(|r| Arc::new(Mutex::new(r)));
+    enqueue(&queue, &seen, &total, initial);
+
     let out: Arc<Mutex<Vec<Candidate>>> = Arc::new(Mutex::new(Vec::new()));
-    let done = Arc::new(Mutex::new(0usize));
     let jar = jar.to_path_buf();
     let referer = referer.to_string();
+    let workers = PROBE_WORKERS.min(total.load(Ordering::Relaxed).max(1));
 
-    let workers = PROBE_WORKERS.min(total.max(1));
     let mut handles = Vec::new();
     for _ in 0..workers {
         let queue = queue.clone();
-        let out = out.clone();
+        let seen = seen.clone();
+        let total = total.clone();
         let done = done.clone();
+        let closed = closed.clone();
+        let rx = rx.clone();
+        let out = out.clone();
         let jar = jar.clone();
         let referer = referer.clone();
         let shared2 = shared.clone();
-        handles.push(thread::spawn(move || {
-            loop {
-                if cancelled(&shared2) {
-                    break;
-                }
-                let item = match queue.lock().unwrap().pop_front() {
-                    Some(x) => x,
-                    None => break,
-                };
+        handles.push(thread::spawn(move || loop {
+            if cancelled(&shared2) {
+                break;
+            }
+            let item = queue.lock().unwrap().pop_front();
+            if let Some(item) = item {
                 if let Some(c) = probe_one(&item, &jar, &referer) {
                     out.lock().unwrap().push(c);
                 }
-                let mut d = done.lock().unwrap();
-                *d += 1;
-                let now = *d;
-                drop(d);
-                set_msg(&shared2, format!("探测文件信息 {}/{}", now, total));
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                set_msg(
+                    &shared2,
+                    format!(
+                        "探测文件信息 {}/{}",
+                        d,
+                        total.load(Ordering::Relaxed).max(d)
+                    ),
+                );
+                continue;
+            }
+            if closed.load(Ordering::Relaxed) {
+                break;
+            }
+            // 队列暂时空：清单可能还在路上，收一批或稍等
+            let mut got = false;
+            if let Some(rx) = &rx {
+                let batch = rx.lock().unwrap().try_recv();
+                match batch {
+                    Ok(items) => {
+                        enqueue(&queue, &seen, &total, items);
+                        got = true;
+                    }
+                    Err(TryRecvError::Disconnected) => closed.store(true, Ordering::Relaxed),
+                    Err(TryRecvError::Empty) => {}
+                }
+            }
+            if !got {
+                thread::sleep(Duration::from_millis(10));
             }
         }));
     }
     for h in handles {
         let _ = h.join();
     }
+
     let mut v = Arc::try_unwrap(out).map(|m| m.into_inner().unwrap()).unwrap_or_default();
     // 同一最终地址只保留一条（重定向后的多个入口会指到同一个文件）
     let mut by_url: BTreeMap<String, Candidate> = BTreeMap::new();
@@ -718,6 +802,7 @@ fn probe_one(item: &Raw, jar: &Path, referer: &str) -> Option<Candidate> {
         note,
         checked: true,
         order: item.order,
+        sha256: item.sha256.clone(),
     })
 }
 

@@ -210,7 +210,8 @@ impl App {
             if !c.page.is_empty() {
                 headers.insert("Referer".into(), c.page.clone());
             }
-            let task = Task::new(c.url.clone(), kind, c.title.clone());
+            let mut task = Task::new(c.url.clone(), kind, c.title.clone());
+            task.sha256 = c.sha256.clone();
             let t: Shared = Arc::new(Mutex::new(task));
             engine::spawn_ext(
                 self.root.clone(),
@@ -397,6 +398,9 @@ impl App {
                                 pill(ui, "推荐", SUCCESS, SUCCESS_BG);
                             }
                             pill(ui, &c.type_label, SECONDARY, PANEL);
+                            if c.sha256.is_some() {
+                                pill(ui, "SHA256", PRIMARY, tint(PRIMARY, 26));
+                            }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -450,33 +454,58 @@ impl App {
     }
 
     fn add_task(&mut self) {
-        let url = self.url.trim().to_string();
+        let raw = self.url.trim().to_string();
         let ol = self.ol_path.trim().to_string();
-        if url.is_empty() && ol.is_empty() {
+        if raw.is_empty() && ol.is_empty() {
             self.notify("请输入下载链接或 OpenList 路径");
             return;
         }
-        let (kind, _why) = if ol.is_empty() {
-            engine::classify(&url)
+
+        // 一次粘贴多行链接：逐行入队，空行和 # 注释跳过
+        if ol.is_empty() && raw.contains('\n') {
+            let lines: Vec<String> = raw
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .collect();
+            if lines.len() > 1 {
+                let mut n = 0;
+                for l in lines {
+                    let (kind, _) = engine::classify(&l);
+                    self.push_task(l, kind, None);
+                    n += 1;
+                }
+                self.url.clear();
+                self.notify(format!("已加入 {} 个任务", n));
+                return;
+            }
+        }
+
+        if !ol.is_empty() {
+            let task_url = format!("openlist:{}", ol);
+            self.push_task(task_url, engine::Kind::OpenList, Some(ol));
+            self.ol_path.clear();
         } else {
-            (engine::Kind::OpenList, "OpenList 路径")
-        };
-        let task = Task::new(
-            if ol.is_empty() { url } else { format!("openlist:{}", ol) },
-            kind,
-            "解析中…".into(),
-        );
+            let (kind, _) = engine::classify(&raw);
+            self.push_task(raw, kind, None);
+        }
+        self.url.clear();
+        save_config(&self.cfg);
+    }
+
+    fn push_task(&mut self, url: String, kind: engine::Kind, ol: Option<String>) {
+        let task = Task::new(url, kind, "解析中…".into());
         let shared: Shared = Arc::new(Mutex::new(task));
-        let dir = self.cfg.dir.clone();
-        let conn = self.cfg.conn;
-        let engine_mode = self.cfg.engine.clone();
-        let ol_opt = if ol.is_empty() { None } else { Some(ol) };
-        engine::spawn(self.root.clone(), shared.clone(), dir, conn, engine_mode, ol_opt);
+        engine::spawn(
+            self.root.clone(),
+            shared.clone(),
+            self.cfg.dir.clone(),
+            self.cfg.conn,
+            self.cfg.engine.clone(),
+            ol,
+        );
         self.tasks.push(shared);
         self.selected = self.tasks.len() - 1;
-        self.url.clear();
-        self.ol_path.clear();
-        save_config(&self.cfg);
     }
 
     fn notify(&mut self, msg: impl Into<String>) {
@@ -1126,6 +1155,50 @@ impl eframe::App for App {
                     return;
                 }
 
+                // 多任务汇总：正在下载/排队的合计进度、总速度与剩余时间
+                {
+                    let mut done = 0u64;
+                    let mut total = 0u64;
+                    let mut speed = 0.0f64;
+                    let mut active = 0usize;
+                    for t in &self.tasks {
+                        if let Some(s) = snapshot(t) {
+                            if s.status == Status::Running || s.status == Status::Queued {
+                                active += 1;
+                                done += s.done;
+                                total += s.total;
+                                speed += s.speed;
+                            }
+                        }
+                    }
+                    if active > 0 {
+                        let left = if total > 0 {
+                            format!("{} / {}", fmt_size(done), fmt_size(total))
+                        } else {
+                            fmt_size(done)
+                        };
+                        ui.horizontal(|ui| {
+                            pill(ui, &format!("{} 个任务", active), PRIMARY, tint(PRIMARY, 26));
+                            ui.label(RichText::new(left).size(11.5).color(SECONDARY));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} · ETA {}",
+                                            fmt_speed(speed),
+                                            fmt_eta(done, total, speed)
+                                        ))
+                                        .size(11.5)
+                                        .color(PRIMARY),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(6.0);
+                    }
+                }
+
                 let mut selected_now = self.selected;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -1416,13 +1489,15 @@ fn headless_scan() -> i32 {
             } else {
                 format!("  [{}]", c.note)
             };
+            let hash = if c.sha256.is_some() { "  [SHA256]" } else { "" };
             println!(
-                "{:>3}. [{}] {:>9}  {}{}{}\n     {}",
+                "{:>3}. [{}] {:>9}  {}{}{}{}\n     {}",
                 i + 1,
                 c.type_label,
                 size,
                 c.title,
                 if Some(i) == recommended { "  ★推荐" } else { "" },
+                hash,
                 note,
                 c.url
             );

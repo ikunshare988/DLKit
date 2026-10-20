@@ -56,6 +56,9 @@ Start:
 - Pause / resume: in-flight connections are dropped and block progress is saved; resume only fetches what is missing
 - Global speed limit from 0 to 100 MB/s (0 = unlimited; applies to the built-in engine)
 - Copying a link fills the input box; links and `.torrent` files can be dropped onto the window
+- Paste several links at once; each line becomes a task
+- Existing files are never overwritten — a ` (1)` suffix is added automatically
+- Free disk space is checked before preallocation, with the required and available sizes in the error
 - Falls back to a single connection when the server ignores Range requests
 - Real file names via redirects and `Content-Disposition`
 - 429/403 back off and lower concurrency; 404/410 fail fast instead of retrying
@@ -65,8 +68,10 @@ Start:
 - Paste a download page (not a direct link) and hit "Scan page"
 - Extracts links from `a`, `video/audio/source`, `iframe`, `meta og:video`, `link rel=enclosure`, plus URLs embedded in inline JSON
 - Sends a HEAD request per candidate, follows redirects, and reads the real name, size and type
+- Up to 24 probes run concurrently and the manifest is fetched in parallel; a page with 40+ candidates usually resolves in 5–6 seconds
 - Follows one more level of same-origin download pages
-- When the page is rendered by JavaScript (nodejs.org only exposes the source tarball), it also reads the directory's checksum manifest (`SHASUMS256.txt` and friends) to list every artifact, including `.zip` / `.msi`
+- When the page is rendered by JavaScript (nodejs.org only exposes the source tarball), it also reads the directory's checksum manifest (`SHASUMS256.txt` and friends) to list every artifact, including `.zip` / `.msi`; the manifest is fetched in parallel with probing
+- SHA256 values from the manifest are carried along (marked `SHA256`) and verified after the download; a mismatch fails the task and reports both hashes
 - When a page offers several platforms, the package matching your OS is pre-selected; "Choose myself" expands everything
 - Results keep page order and can be ticked and queued in bulk
 - Legacy GBK-encoded sites display titles correctly

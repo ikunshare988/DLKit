@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -87,6 +88,8 @@ pub struct Task {
     pub pause: Arc<AtomicBool>,
     /// 首次启动时的参数，供「继续」复用
     pub spawn: Option<SpawnArgs>,
+    /// 官方清单给出的 SHA256（可选），下载完成后自动核对
+    pub sha256: Option<String>,
     pub output: Option<PathBuf>,
     pub started: Instant,
 }
@@ -110,6 +113,7 @@ impl Task {
             cancel: Arc::new(AtomicBool::new(false)),
             pause: Arc::new(AtomicBool::new(false)),
             spawn: None,
+            sha256: None,
             output: None,
             started: Instant::now(),
         }
@@ -226,6 +230,113 @@ fn sanitize_name(name: &str) -> String {
     } else {
         t
     }
+}
+
+/// 拆出主名与扩展名；`.tar.gz` 这类复合扩展名当成一个整体
+fn split_ext(name: &str) -> (&str, &str) {
+    let lower = name.to_ascii_lowercase();
+    for double in [".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tar.7z"] {
+        if lower.ends_with(double) {
+            let cut = name.len() - double.len();
+            return (&name[..cut], &name[cut..]);
+        }
+    }
+    match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    }
+}
+
+/// 选一个可用的文件名：
+/// - 不存在 → 直接用
+/// - 存在但有同名 `.dlkit.json`（上次没下完）→ 沿用，继续续传
+/// - 存在且没有进度 → 依次尝试「名字 (1)」「名字 (2)」…
+fn pick_name(dir: &Path, name: &str, ignore: Option<&Path>) -> String {
+    let usable = |n: &str| -> bool {
+        let p = dir.join(n);
+        if let Some(ig) = ignore {
+            if p == ig {
+                return true;
+            }
+        }
+        !p.exists() || dir.join(format!("{}.dlkit.json", n)).exists()
+    };
+    if usable(name) {
+        return name.to_string();
+    }
+    let (stem, ext) = split_ext(name);
+    for i in 1..=999 {
+        let cand = format!("{} ({}){}", stem, i, ext);
+        if usable(&cand) {
+            return cand;
+        }
+    }
+    name.to_string()
+}
+
+/// 目标目录所在磁盘的可用空间（字节）
+#[cfg(windows)]
+fn free_space(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            dir: *const u16,
+            free_for_caller: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+    let mut w: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    w.push(0);
+    let mut free = 0u64;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            w.as_ptr(),
+            &mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 {
+        Some(free)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(windows))]
+fn free_space(_dir: &Path) -> Option<u64> {
+    None
+}
+
+fn human_size(n: u64) -> String {
+    const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i + 1 < U.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{} {}", n, U[i])
+    } else {
+        format!("{:.1} {}", v, U[i])
+    }
+}
+
+/// 预分配前先看磁盘：剩余空间不够就直接报错，别等写满才发现
+fn ensure_space(dir: &Path, size: u64) -> Result<(), EngErr> {
+    const MARGIN: u64 = 64 << 20;
+    if let Some(free) = free_space(dir) {
+        if free < size.saturating_add(MARGIN) {
+            return Err(EngErr::Fatal(format!(
+                "磁盘空间不足：需要约 {}，可用 {}",
+                human_size(size),
+                human_size(free)
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn percent_decode(s: &str) -> String {
@@ -646,6 +757,30 @@ fn set_io(task: &Shared, net: f64, disk: f64) {
         t.net_speed = net;
         t.disk_speed = disk;
     }
+}
+
+/// 计算文件的 SHA256（小写十六进制）
+fn sha256_of(path: &Path) -> Option<String> {
+    let mut f = File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut s = String::with_capacity(64);
+    for b in digest.iter() {
+        s.push_str(&format!("{:02x}", b));
+    }
+    Some(s)
+}
+
+fn short_hash(h: &str) -> &str {
+    &h[..8.min(h.len())]
 }
 
 fn log_line(task: &Shared, line: String) {
@@ -1340,7 +1475,7 @@ pub fn run_fast(
         }
     }
     let seq = task_seq();
-    let name0 = sanitize_name(&filename_from_url(url));
+    let name0 = pick_name(out_dir, &sanitize_name(&filename_from_url(url)), None);
     let mut out_path = out_dir.join(&name0);
     let hdr_path = out_dir.join(format!(".dlkit-boot-{}-{}.hdr", std::process::id(), seq));
     let _ = fs::remove_file(&hdr_path);
@@ -1472,6 +1607,8 @@ pub fn run_fast(
         .clone()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| name0.clone());
+    // 服务端给的文件名也要避开已存在的完整文件；正在写的这个文件本身除外
+    let final_name = pick_name(out_dir, &sanitize_name(&final_name), Some(&out_path));
     let fetch_url = if head.final_url.is_empty() {
         url.to_string()
     } else {
@@ -1513,6 +1650,7 @@ pub fn run_fast(
 
     let size = head.size;
     if file.metadata().map(|m| m.len()).unwrap_or(0) != size {
+        ensure_space(out_dir, size)?;
         file.set_len(size)
             .map_err(|e| EngErr::Fatal(format!("预分配磁盘空间失败：{}", e)))?;
     }
@@ -1585,7 +1723,7 @@ pub fn run_fast(
         ),
     );
 
-    let state_path = out_dir.join(format!("{}.dlkit.json", final_name));
+    let state_path = out_dir.join(format!("{}.dlkit.json", name0));
     #[derive(serde::Serialize, serde::Deserialize, Default)]
     struct State {
         size: u64,
@@ -1874,11 +2012,17 @@ pub fn run_fast(
 }
 
 fn rename_out(from: &Path, dir: &Path, final_name: &str) -> PathBuf {
-    let target = dir.join(final_name);
+    let mut target = dir.join(final_name);
     if target == from {
         return from.to_path_buf();
     }
-    let _ = fs::remove_file(&target);
+    // 目标已被别人占用（极少见）：再挑一个不冲突的名字
+    if target.exists() {
+        target = dir.join(pick_name(dir, final_name, Some(from)));
+        if target == from {
+            return from.to_path_buf();
+        }
+    }
     match fs::rename(from, &target) {
         Ok(_) => target,
         Err(_) => from.to_path_buf(),
@@ -1897,7 +2041,8 @@ pub fn run_turbo(
         return Err(EngErr::Soft("目标不支持 Range，无法分片".into()));
     }
     let _ = fs::create_dir_all(out_dir);
-    let out_path = out_dir.join(&pr.name);
+    let out_name = pick_name(out_dir, &pr.name, None);
+    let out_path = out_dir.join(&out_name);
     let size = pr.size;
 
     // 清理上次异常退出留下的临时响应头文件
@@ -1920,7 +2065,7 @@ pub fn run_turbo(
     let total_blocks = ((size + block - 1) / block) as usize;
     let workers = conn.max(1).min(total_blocks).max(1);
 
-    let state_path = out_dir.join(format!("{}.dlkit.json", pr.name));
+    let state_path = out_dir.join(format!("{}.dlkit.json", out_name));
     #[derive(serde::Serialize, serde::Deserialize, Default)]
     struct State {
         size: u64,
@@ -1942,6 +2087,7 @@ pub fn run_turbo(
         .open(&out_path)
         .map_err(|e| EngErr::Fatal(format!("无法创建目标文件：{}", e)))?;
     if file.metadata().map(|m| m.len()).unwrap_or(0) != size {
+        ensure_space(out_dir, size)?;
         file.set_len(size)
             .map_err(|e| EngErr::Fatal(format!("预分配磁盘空间失败：{}", e)))?;
     }
@@ -3224,15 +3370,46 @@ pub fn spawn_ext(
             }
         };
 
+        // 校验放在加锁之前：大文件算 SHA256 要几秒，不能占着任务锁
+        let mut hash_bad: Option<(String, String)> = None;
+        let result = match result {
+            Ok(path) => {
+                let want = task.lock().ok().and_then(|t| t.sha256.clone());
+                if let Some(want) = want {
+                    if let Some(got) = sha256_of(&path) {
+                        if !got.eq_ignore_ascii_case(want.trim()) {
+                            hash_bad = Some((want, got));
+                        }
+                    }
+                }
+                Ok(path)
+            }
+            other => other,
+        };
+
         if let Ok(mut t) = task.lock() {
             t.speed = 0.0;
             t.net_speed = 0.0;
             t.disk_speed = 0.0;
             match result {
                 Ok(path) => {
-                    t.status = Status::Done;
-                    t.message = "已完成".into();
-                    t.output = Some(path);
+                    if let Some((want, got)) = hash_bad {
+                        t.status = Status::Failed;
+                        t.message = format!(
+                            "SHA256 与官方清单不一致（期望 {}…，实际 {}…）",
+                            short_hash(&want),
+                            short_hash(&got)
+                        );
+                        t.log.push(format!("SHA256 不匹配：期望 {}，实际 {}", want, got));
+                        t.output = Some(path);
+                    } else {
+                        if t.sha256.is_some() {
+                            t.log.push("SHA256 校验通过".into());
+                        }
+                        t.status = Status::Done;
+                        t.message = "已完成".into();
+                        t.output = Some(path);
+                    }
                     if t.total == 0 {
                         t.total = t.done;
                     }
@@ -3458,6 +3635,94 @@ mod tests {
         );
         let got = fs::read(dir.join("file.bin")).expect("输出文件不存在");
         assert!(got == data, "文件内容不一致");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 清单里的哈希匹配时，任务应正常完成并留下校验日志
+    #[test]
+    fn hash_match_passes() {
+        let (url, data) = test_server(4 * 1024 * 1024);
+        let dir = std::env::temp_dir().join(format!("dlkit-hash-ok-{}", task_seq()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut task = Task::new(url, Kind::Http, "file.bin".into());
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        let expect = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+        task.sha256 = Some(expect);
+        let task: Shared = Arc::new(Mutex::new(task));
+        spawn_ext(
+            PathBuf::from("."),
+            task.clone(),
+            dir.clone(),
+            4,
+            "auto".into(),
+            None,
+            BTreeMap::new(),
+        );
+        assert!(wait_status(&task, Status::Done, 60), "哈希正确时未完成");
+        let logged = task
+            .lock()
+            .unwrap()
+            .log
+            .iter()
+            .any(|l| l.contains("SHA256 校验通过"));
+        assert!(logged, "缺少校验通过日志");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 哈希不一致时任务应判失败，并给出可读的原因
+    #[test]
+    fn hash_mismatch_fails() {
+        let (url, _data) = test_server(4 * 1024 * 1024);
+        let dir = std::env::temp_dir().join(format!("dlkit-hash-bad-{}", task_seq()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut task = Task::new(url, Kind::Http, "file.bin".into());
+        task.sha256 = Some("0".repeat(64));
+        let task: Shared = Arc::new(Mutex::new(task));
+        spawn_ext(
+            PathBuf::from("."),
+            task.clone(),
+            dir.clone(),
+            4,
+            "auto".into(),
+            None,
+            BTreeMap::new(),
+        );
+        assert!(wait_status(&task, Status::Failed, 60), "哈希不符未判失败");
+        let msg = task.lock().unwrap().message.clone();
+        assert!(msg.contains("SHA256"), "失败原因不明确：{}", msg);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 同名文件已存在且没有进度时，自动改用「名字 (1)」
+    #[test]
+    fn existing_file_gets_suffix() {
+        let (url, data) = test_server(4 * 1024 * 1024);
+        let dir = std::env::temp_dir().join(format!("dlkit-suffix-{}", task_seq()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("file.bin"), b"old contents").unwrap();
+
+        let task: Shared = Arc::new(Mutex::new(Task::new(url, Kind::Http, "file.bin".into())));
+        spawn_ext(
+            PathBuf::from("."),
+            task.clone(),
+            dir.clone(),
+            4,
+            "auto".into(),
+            None,
+            BTreeMap::new(),
+        );
+        assert!(wait_status(&task, Status::Done, 60), "下载未完成");
+
+        let old = fs::read(dir.join("file.bin")).unwrap();
+        assert_eq!(old, b"old contents", "旧文件不应被覆盖");
+        let got = fs::read(dir.join("file (1).bin")).expect("没有生成带序号的文件");
+        assert!(got == data, "新文件内容不一致");
         let _ = fs::remove_dir_all(&dir);
     }
 }
