@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ui
+
+      - name: 编译
+        working-directory: ui
+        run: cargo build --release --locked
+
+      - name: 打包并计算校验值
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item ui\target\release\dlkit.exe dist\DLKit.exe
+          $hash = (Get-FileHash dist\DLKit.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  DLKit.exe" | Set-Content -Encoding ascii dist\SHA256.txt
+          Get-Content dist\SHA256.txt
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/DLKit.exe
+            dist/SHA256.txt
+          generate_release_notes: true

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 下载与版本说明
+    url: https://github.com/ikunshare988/DLKit/releases
+    about: 先看看最新版本和已知问题的说明

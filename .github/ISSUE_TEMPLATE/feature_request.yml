@@ -1,0 +1,43 @@
+name: 功能建议
+description: 希望支持的新站点、新格式或新行为
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先说明**你实际遇到的场景**，而不是直接给方案——很多时候场景相同但做法可以更简单。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 现在哪里不方便
+      placeholder: 每次下载都要手动把 3 个文件分别拖进去，希望能记住上次的勾选
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: 你希望的用法
+      placeholder: 解析结果里加一个「只显示安装包」的筛选
+    validations:
+      required: false
+
+  - type: input
+    id: example
+    attributes:
+      label: 例子站点或文件
+      description: 能公开访问的示例最好；不要粘贴需要登录的私有地址
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 涉及范围
+      options:
+        - label: 下载页解析
+        - label: 直链下载 / 多源镜像
+        - label: 界面
+        - label: 命令行
+        - label: 其它来源（BT / 视频站 / 网盘）

@@ -1,0 +1,74 @@
+name: 问题反馈
+description: 下载失败、解析不到文件、界面异常等
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。请尽量把信息填全，特别是**实际链接类型**与**日志**，这两项决定了问题能不能复现。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 实际结果与期望结果
+      placeholder: |
+        期望：正常下载完成
+        实际：进度停在 12%，几秒后提示「部分分块下载失败」
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 粘贴链接 ...
+        2. 连接数设为 ...
+        3. 开始下载
+    validations:
+      required: true
+
+  - type: input
+    id: link-kind
+    attributes:
+      label: 链接或页面类型
+      description: 直链 / 下载页 / 磁力 / 视频站 / 网盘。能给出脱敏后的地址更好；不要粘贴带隐私参数的完整链接
+      placeholder: 下载页，站点域名 example.com
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: 日志
+      description: 界面下方「日志」里的内容，或 `--headless` 的输出
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: DLKit 版本
+      description: Release 版本号，或提交哈希
+      placeholder: v0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: 系统
+      placeholder: Windows 11 23H2 / Windows 10 22H2
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: extras
+    attributes:
+      label: 补充情况
+      options:
+        - label: 浏览器可以直接下载同一个链接
+        - label: 目标需要登录或 Cookie
+        - label: 使用了代理、VPN 或 hosts 加速
