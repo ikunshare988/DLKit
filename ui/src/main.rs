@@ -3,6 +3,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accounts;
 mod deps;
 mod engine;
 mod platform;
@@ -128,6 +129,7 @@ fn save_config(cfg: &Config) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Download,
+    Accounts,
     Settings,
 }
 
@@ -146,6 +148,9 @@ struct App {
     scan: Option<scanner::ScanShared>,
     page: Page,
     deps: deps::Installer,
+    acc: accounts::Accounts,
+    /// 账号页的保存/测试结果
+    acc_msg: String,
     /// 用户点过「自己选」后，收起平台推荐横幅
     scan_hint_hidden: bool,
     /// 上一次看到的剪贴板内容，用来判断是否是新复制的链接
@@ -193,6 +198,8 @@ impl App {
         let tray = tray::Tray::new();
         let updater = update::Updater::new();
         updater.check();
+        let root = engine::find_root();
+        let acc = accounts::Accounts::load(&root);
         let app = App {
             url: String::new(),
             ol_path: String::new(),
@@ -202,12 +209,14 @@ impl App {
             selected: 0,
             toast: String::new(),
             toast_at: Instant::now() - Duration::from_secs(10),
-            root: engine::find_root(),
+            root,
             svc_online: false,
             svc_checked: Instant::now() - Duration::from_secs(10),
             scan: None,
             page: Page::Download,
             deps: deps::Installer::new(),
+            acc,
+            acc_msg: String::new(),
             scan_hint_hidden: false,
             // 启动时已有的剪贴板内容不算「新复制」，避免一打开就自动填入
             clip_last: clipboard_text().unwrap_or_default(),
@@ -267,6 +276,190 @@ impl App {
             )),
             Err(e) => self.notify(format!("启动失败：{}", e)),
         }
+    }
+
+    /// 账号页：B 站 Cookie 与网盘（OpenList）登录
+    fn draw_accounts(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                card_frame().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("B 站账号").strong().size(15.0).color(TEXT));
+                        if self.acc.bili_ready() {
+                            pill(ui, "已配置", SUCCESS, SUCCESS_BG);
+                        } else {
+                            pill(ui, "未配置", MUTED, PANEL);
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("1080P 及以上、番剧、大会员内容需要登录；公开视频不登录也能下")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                    ui.add_space(8.0);
+
+                    let mut mode = self.acc.bili_mode.clone();
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut mode, accounts::MODE_NONE.to_string(), "不使用");
+                        ui.radio_value(&mut mode, accounts::MODE_BROWSER.to_string(), "从浏览器读取");
+                        ui.radio_value(&mut mode, accounts::MODE_MANUAL.to_string(), "手动粘贴 Cookie");
+                    });
+                    self.acc.bili_mode = mode;
+
+                    if self.acc.bili_mode == accounts::MODE_BROWSER {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("浏览器").size(12.0).color(SECONDARY));
+                            egui::ComboBox::from_id_salt("bili-browser")
+                                .selected_text(match self.acc.bili_browser.as_str() {
+                                    "chrome" => "Chrome",
+                                    "firefox" => "Firefox",
+                                    _ => "Edge",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.acc.bili_browser,
+                                        "edge".into(),
+                                        "Edge",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.acc.bili_browser,
+                                        "chrome".into(),
+                                        "Chrome",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.acc.bili_browser,
+                                        "firefox".into(),
+                                        "Firefox",
+                                    );
+                                });
+                            ui.label(
+                                RichText::new("该浏览器登录过 B 站即可；Chrome 需要先完全退出")
+                                    .size(11.0)
+                                    .color(MUTED),
+                            );
+                        });
+                    } else if self.acc.bili_mode == accounts::MODE_MANUAL {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(
+                                "粘贴整段 Cookie（浏览器 F12 → Network → 任一请求 → Cookie）",
+                            )
+                            .size(11.0)
+                            .color(MUTED),
+                        );
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.acc.bili_cookie)
+                                .desired_rows(3)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("SESSDATA=...; bili_jct=...；"),
+                        );
+                    }
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let btn = egui::Button::new(
+                            RichText::new("保存").size(12.0).color(Color32::WHITE),
+                        )
+                        .fill(PRIMARY)
+                        .corner_radius(CornerRadius::same(12));
+                        if ui.add(btn).clicked() {
+                            self.acc_msg = match self.acc.save(&self.root) {
+                                Ok(()) => "B 站账号设置已保存".into(),
+                                Err(e) => e,
+                            };
+                        }
+                        if !self.acc_msg.is_empty() {
+                            ui.label(RichText::new(&self.acc_msg).size(11.0).color(SECONDARY));
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Cookie 用 Windows DPAPI 加密后保存在 config/accounts.json，只有当前用户能解密",
+                        )
+                        .size(10.5)
+                        .color(MUTED),
+                    );
+                });
+
+                ui.add_space(12.0);
+
+                card_frame().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("网盘（OpenList）").strong().size(15.0).color(TEXT));
+                        if self.svc_online {
+                            pill(ui, "OpenList 端口在线", SUCCESS, SUCCESS_BG);
+                        } else {
+                            pill(ui, "服务未启动", MUTED, PANEL);
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "百度网盘 / 阿里云盘 / 夸克等先在 OpenList 后台扫码或登录一次，DLKit 只负责取直链",
+                        )
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                    ui.add_space(8.0);
+                    egui::Grid::new("ol-acc")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("地址").size(12.0).color(SECONDARY));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.acc.ol_base)
+                                    .desired_width(320.0)
+                                    .hint_text("http://127.0.0.1:5244"),
+                            );
+                            ui.end_row();
+
+                            ui.label(RichText::new("用户名").size(12.0).color(SECONDARY));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.acc.ol_user)
+                                    .desired_width(220.0),
+                            );
+                            ui.end_row();
+
+                            ui.label(RichText::new("密码").size(12.0).color(SECONDARY));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.acc.ol_pass)
+                                    .desired_width(220.0)
+                                    .password(true),
+                            );
+                            ui.end_row();
+                        });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let btn = egui::Button::new(
+                            RichText::new("保存并测试").size(12.0).color(Color32::WHITE),
+                        )
+                        .fill(PRIMARY)
+                        .corner_radius(CornerRadius::same(12));
+                        if ui.add(btn).clicked() {
+                            self.acc_msg = match self.acc.save(&self.root) {
+                                Ok(()) => match engine::openlist_test(&self.root) {
+                                    Ok(()) => "OpenList 登录成功".into(),
+                                    Err(e) => format!("已保存，但登录失败：{}", e),
+                                },
+                                Err(e) => e,
+                            };
+                        }
+                        if ui.button("打开 OpenList 管理页").clicked() {
+                            let url = self.acc.ol_base.trim().to_string();
+                            let _ = std::process::Command::new("cmd")
+                                .args(["/c", "start", "", &url])
+                                .spawn();
+                        }
+                        if !self.svc_online && ui.button("启动服务").clicked() {
+                            self.start_services();
+                        }
+                    });
+                });
+            });
     }
 
     /// 设置页：下载参数、依赖补齐、更新
@@ -1519,6 +1712,8 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 nav_item(ui, "下载", Page::Download, &mut self.page);
                 ui.add_space(4.0);
+                nav_item(ui, "账号", Page::Accounts, &mut self.page);
+                ui.add_space(4.0);
                 nav_item(ui, "设置", Page::Settings, &mut self.page);
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     if missing > 0 && ui.button(format!("缺 {} 个依赖", missing)).clicked() {
@@ -1645,6 +1840,10 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 if self.page == Page::Settings {
                     self.draw_settings(ui);
+                    return;
+                }
+                if self.page == Page::Accounts {
+                    self.draw_accounts(ui);
                     return;
                 }
                 self.draw_update(ui);

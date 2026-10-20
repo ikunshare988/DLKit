@@ -18,6 +18,15 @@
 
 exe 未做代码签名，Windows 首次运行时可能提示「已保护你的电脑」，点「更多信息 → 仍要运行」即可。每个 Release 都附 `SHA256.txt`，可以自行核对。
 
+每个 Release 还附 `DLKit.exe.bundle`：GitHub Actions 里的 Sigstore 无密钥签名，证书中记录了仓库、工作流和 tag。装了 [cosign](https://docs.sigstore.dev/cosign/installation/) 后可以验证：
+
+```powershell
+cosign verify-blob --bundle DLKit.exe.bundle `
+  --certificate-identity-regexp "https://github.com/ikunshare988/DLKit/.github/workflows/release.yml@refs/tags/.*" `
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com `
+  DLKit.exe
+```
+
 ## 运行
 
 程序本身是一个 exe，但下载能力依赖几个命令行工具。按下面的结构放在程序目录下：
@@ -123,6 +132,13 @@ downloads/
 - BT / 磁力：交给 aria2
 - 视频站（B站、YouTube、抖音等）：交给 yt-dlp，音视频用 ffmpeg 合并
 - 网盘：通过 OpenList 取直链（需要自己部署 OpenList 并挂载）
+
+### 账号
+
+- 「账号」页管理 B 站登录：可以直接读取 Edge / Chrome / Firefox 里已登录的 Cookie（交给 yt-dlp），也可以手动粘贴
+- 登录后可下载 1080P、番剧和大会员内容（清晰度仍取决于账号权限）
+- 手动粘贴的 Cookie 用 Windows DPAPI 加密后保存在 `config/accounts.json`，拷走配置也读不出明文
+- 网盘：在同一页填 OpenList 地址和账号，点「保存并测试」；百度 / 阿里 / 夸克等先在 OpenList 后台登录一次，DLKit 只负责取直链
 
 ### 后台与更新
 

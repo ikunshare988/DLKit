@@ -15,6 +15,7 @@
 /config/aria2.session
 /config/openlist.json
 /config/ui.json
+/config/accounts.json
 /config/mirrors.json
 /config/cacert.pem
 

@@ -3972,6 +3972,10 @@ fn run_media(task: Shared, root: &Path, url: &str, dir: &Path, headers: &BTreeMa
     if let Some(v) = headers.get("User-Agent") {
         cmd.arg("--user-agent").arg(v);
     }
+    // 账号页配置的 B 站登录方式（浏览器 Cookie 或手动粘贴的 Cookie）
+    if headers.get("Cookie").is_none() {
+        crate::accounts::Accounts::load(root).apply_media(&mut cmd);
+    }
     cmd.arg(url);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
@@ -4191,6 +4195,25 @@ pub fn default_headers() -> BTreeMap<String, String> {
     let mut h = BTreeMap::new();
     h.insert("User-Agent".into(), DEFAULT_UA.into());
     h
+}
+
+/// 验证 OpenList 地址与账号（账号页「保存并测试」用）
+pub fn openlist_test(root: &Path) -> Result<(), String> {
+    let (base, user, pass) = openlist_conf(root);
+    let data = ol_post(
+        &base,
+        "/api/auth/login",
+        json!({"username": user, "password": pass}),
+        None,
+    )
+    .map_err(|e| match e {
+        EngErr::Fatal(m) | EngErr::Soft(m) => m,
+    })?;
+    let token = data.get("token").and_then(|t| t.as_str()).unwrap_or("");
+    if token.is_empty() {
+        return Err("登录失败：账号或密码不正确".into());
+    }
+    Ok(())
 }
 
 // ---------------- 任务调度 ----------------

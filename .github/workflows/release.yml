@@ -6,6 +6,8 @@ on:
 
 permissions:
   contents: write
+  # Sigstore 无密钥签名需要 OIDC 令牌
+  id-token: write
 
 jobs:
   build:
@@ -32,10 +34,21 @@ jobs:
           "$hash  DLKit.exe" | Set-Content -Encoding ascii dist\SHA256.txt
           Get-Content dist\SHA256.txt
 
+      - name: 安装 cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sigstore 无密钥签名
+        shell: pwsh
+        run: |
+          # 证书里会记录本仓库、本工作流和 tag，任何人都能离线验证签名来源
+          cosign sign-blob --yes --bundle dist\DLKit.exe.bundle dist\DLKit.exe
+          Get-ChildItem dist
+
       - name: 创建 Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/DLKit.exe
             dist/SHA256.txt
+            dist/DLKit.exe.bundle
           generate_release_notes: true

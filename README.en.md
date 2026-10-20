@@ -18,6 +18,15 @@ Get `DLKit.exe` from [Releases](https://github.com/ikunshare988/DLKit/releases) 
 
 The exe is not code-signed, so Windows SmartScreen may warn on first launch — choose "More info → Run anyway". Every release ships a `SHA256.txt` you can verify.
 
+Each release also ships `DLKit.exe.bundle`, a keyless Sigstore signature produced in GitHub Actions. The certificate records this repository, workflow and tag. With [cosign](https://docs.sigstore.dev/cosign/installation/) installed:
+
+```powershell
+cosign verify-blob --bundle DLKit.exe.bundle `
+  --certificate-identity-regexp "https://github.com/ikunshare988/DLKit/.github/workflows/release.yml@refs/tags/.*" `
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com `
+  DLKit.exe
+```
+
 ## Setup
 
 The binary is a single exe, but downloading relies on a few command-line tools. Put them next to it:
@@ -123,6 +132,13 @@ A rule means: when a URL starts with `from`, also try the same URL with that pre
 - Torrents / magnet links: handled by aria2
 - Video sites (Bilibili, YouTube, Douyin and others): handled by yt-dlp, merged with ffmpeg
 - Cloud drives: direct links via OpenList (you host OpenList yourself)
+
+### Accounts
+
+- The Accounts page manages Bilibili login: read cookies from Edge / Chrome / Firefox (passed to yt-dlp), or paste them manually
+- Signing in enables 1080P, bangumi and premium content (resolution still depends on your account)
+- Manually pasted cookies are encrypted with Windows DPAPI in `config/accounts.json`
+- Cloud drives: enter the OpenList address and account on the same page and press "Save and test"; sign in to Baidu / Aliyun / Quark inside OpenList once, DLKit only fetches direct links
 
 ### Background and updates
 
