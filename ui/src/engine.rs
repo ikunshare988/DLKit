@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -52,9 +52,20 @@ impl Kind {
 pub enum Status {
     Queued,
     Running,
+    Paused,
     Done,
     Failed,
     Cancelled,
+}
+
+/// 恢复下载所需的全部参数：暂停后续传时直接复用，不必让界面再传一遍
+#[derive(Clone)]
+pub struct SpawnArgs {
+    pub dir: PathBuf,
+    pub conn: usize,
+    pub engine: String,
+    pub ol_path: Option<String>,
+    pub extra: BTreeMap<String, String>,
 }
 
 pub struct Task {
@@ -72,6 +83,10 @@ pub struct Task {
     pub disk_speed: f64,
     pub log: Vec<String>,
     pub cancel: Arc<AtomicBool>,
+    /// 暂停标志：置位后在途连接会被中断，进度写入状态文件
+    pub pause: Arc<AtomicBool>,
+    /// 首次启动时的参数，供「继续」复用
+    pub spawn: Option<SpawnArgs>,
     pub output: Option<PathBuf>,
     pub started: Instant,
 }
@@ -93,6 +108,8 @@ impl Task {
             disk_speed: 0.0,
             log: Vec::new(),
             cancel: Arc::new(AtomicBool::new(false)),
+            pause: Arc::new(AtomicBool::new(false)),
+            spawn: None,
             output: None,
             started: Instant::now(),
         }
@@ -544,6 +561,72 @@ impl Limiter {
     fn cap(&self) -> usize {
         self.state.lock().unwrap().0
     }
+}
+
+// ---------------- 全局限速 ----------------
+// 所有内置引擎的连接共享一个令牌桶：每个分块读完一批字节后按时长等待，
+// 保证总吞吐不超过设定值。aria2 / yt-dlp 走各自的进程，不受这里限制。
+
+pub struct Bandwidth {
+    /// 字节/秒；0 表示不限速
+    rate: AtomicU64,
+    /// 下一个可发送时刻，用于把突发摊平
+    next: Mutex<Instant>,
+}
+
+impl Bandwidth {
+    fn new() -> Bandwidth {
+        Bandwidth {
+            rate: AtomicU64::new(0),
+            next: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// 单位 MB/s；<= 0 表示不限速
+    pub fn set_rate(&self, mbps: f64) {
+        let v = if mbps > 0.0 {
+            (mbps * 1048576.0) as u64
+        } else {
+            0
+        };
+        self.rate.store(v, Ordering::Relaxed);
+        if let Ok(mut n) = self.next.lock() {
+            *n = Instant::now();
+        }
+    }
+
+    fn throttle(&self, bytes: u64) {
+        let rate = self.rate.load(Ordering::Relaxed);
+        if rate == 0 || bytes == 0 {
+            return;
+        }
+        let need = Duration::from_secs_f64(bytes as f64 / rate as f64);
+        let wait = {
+            let mut next = self.next.lock().unwrap();
+            let now = Instant::now();
+            if *next < now {
+                *next = now;
+            }
+            let wait = *next - now;
+            *next += need;
+            wait
+        };
+        // 单次最多等 400ms：积压太多时宁可略微超出，也不让暂停要等很久
+        if !wait.is_zero() {
+            thread::sleep(wait.min(Duration::from_millis(400)));
+        }
+    }
+}
+
+static BANDWIDTH: OnceLock<Bandwidth> = OnceLock::new();
+
+pub fn bandwidth() -> &'static Bandwidth {
+    BANDWIDTH.get_or_init(Bandwidth::new)
+}
+
+/// 设置全局限速（MB/s），0 表示不限
+pub fn set_speed_limit(mbps: f64) {
+    bandwidth().set_rate(mbps);
 }
 
 // ---------------- 进度工具 ----------------
@@ -1234,6 +1317,10 @@ pub fn run_fast(
     conn: usize,
 ) -> Result<PathBuf, EngErr> {
     let _ = fs::create_dir_all(out_dir);
+    let pause = task
+        .lock()
+        .map(|t| t.pause.clone())
+        .unwrap_or_else(|_| Arc::new(AtomicBool::new(false)));
     // 清掉上次异常退出留下的预取临时文件（只清理 10 分钟以前的，避免误删并发任务）
     if let Ok(entries) = fs::read_dir(out_dir) {
         for e in entries.flatten() {
@@ -1311,6 +1398,7 @@ pub fn run_fast(
         let stop = stop.clone();
         let io = io.clone();
         let head_bytes = head_bytes.clone();
+        let pause_w = pause.clone();
         thread::spawn(move || {
             if let Some(so) = child.stdout.take() {
                 let mut reader = std::io::BufReader::with_capacity(1 << 20, so);
@@ -1318,7 +1406,7 @@ pub fn run_fast(
                 let mut off = 0u64;
                 let mut head: Vec<u8> = Vec::with_capacity(1024);
                 loop {
-                    if stop.load(Ordering::SeqCst) {
+                    if stop.load(Ordering::SeqCst) || pause_w.load(Ordering::SeqCst) {
                         break;
                     }
                     match reader.read(&mut buf) {
@@ -1327,6 +1415,7 @@ pub fn run_fast(
                             let max = limit.load(Ordering::SeqCst);
                             let take = (n as u64).min(max.saturating_sub(off)) as usize;
                             if take > 0 {
+                                bandwidth().throttle(take as u64);
                                 if off < 1024 && head.len() < 1024 {
                                     let need = (1024 - head.len() as u64).min(take as u64) as usize;
                                     head.extend_from_slice(&buf[..need]);
@@ -1576,10 +1665,14 @@ pub fn run_fast(
         let sources = sources.clone();
         let out_dir_arc = out_dir_arc.clone();
         let task_log = task.clone();
+        let pause_w = pause.clone();
         handles.push(thread::spawn(move || {
             let hdr = out_dir_arc.join(format!(".dlkit-hdr-{}.txt", wid));
             loop {
-                if cancel.load(Ordering::SeqCst) || fatal.lock().unwrap().is_some() {
+                if cancel.load(Ordering::SeqCst)
+                    || pause_w.load(Ordering::SeqCst)
+                    || fatal.lock().unwrap().is_some()
+                {
                     break;
                 }
                 let off = match queue.lock().unwrap().pop() {
@@ -1590,11 +1683,14 @@ pub fn run_fast(
                 let lane = (off / block) as usize;
                 let ok = fetch_block(
                     &sources, lane, &headers, &file, off, end, &hdr, &counter, &io_stats, &limiter,
-                    &cancel, &fatal, &task_log,
+                    &cancel, &pause_w, &fatal, &task_log,
                 );
                 if ok {
                     done.lock().unwrap().insert(off);
-                } else if !cancel.load(Ordering::SeqCst) && fatal.lock().unwrap().is_none() {
+                } else if !cancel.load(Ordering::SeqCst)
+                    && !pause_w.load(Ordering::SeqCst)
+                    && fatal.lock().unwrap().is_none()
+                {
                     queue.lock().unwrap().push(off);
                     thread::sleep(Duration::from_millis(700));
                 }
@@ -1732,6 +1828,7 @@ pub fn run_fast(
         }
         if (all_workers && boot_done)
             || cancel.load(Ordering::SeqCst)
+            || pause.load(Ordering::SeqCst)
             || fatal.lock().unwrap().is_some()
         {
             break;
@@ -1753,6 +1850,9 @@ pub fn run_fast(
 
     if let Some(msg) = fatal.lock().unwrap().take() {
         return Err(EngErr::Fatal(msg));
+    }
+    if pause.load(Ordering::SeqCst) {
+        return Err(EngErr::Soft("已暂停，进度已保留".into()));
     }
     if cancel.load(Ordering::SeqCst) {
         return Err(EngErr::Soft("已取消，进度已保留".into()));
@@ -1881,6 +1981,10 @@ pub fn run_turbo(
         .lock()
         .map(|t| t.cancel.clone())
         .unwrap_or_else(|_| Arc::new(AtomicBool::new(false)));
+    let pause = task
+        .lock()
+        .map(|t| t.pause.clone())
+        .unwrap_or_else(|_| Arc::new(AtomicBool::new(false)));
     let headers = Arc::new(headers.clone());
     let sources = Arc::new(Sources::new(url.to_string(), 0));
     let out_dir_arc = Arc::new(out_dir.to_path_buf());
@@ -1908,10 +2012,14 @@ pub fn run_turbo(
         let sources = sources.clone();
         let out_dir_arc = out_dir_arc.clone();
         let task_log = task.clone();
+        let pause_w = pause.clone();
         handles.push(thread::spawn(move || {
             let hdr = out_dir_arc.join(format!(".dlkit-hdr-{}-{}.txt", task_seq(), wid));
             loop {
-                if cancel.load(Ordering::SeqCst) || fatal.lock().unwrap().is_some() {
+                if cancel.load(Ordering::SeqCst)
+                    || pause_w.load(Ordering::SeqCst)
+                    || fatal.lock().unwrap().is_some()
+                {
                     break;
                 }
                 let off = match queue.lock().unwrap().pop() {
@@ -1922,11 +2030,14 @@ pub fn run_turbo(
                 let lane = (off / block) as usize;
                 let ok = fetch_block(
                     &sources, lane, &headers, &file, off, end, &hdr, &counter, &io_stats, &limiter,
-                    &cancel, &fatal, &task_log,
+                    &cancel, &pause_w, &fatal, &task_log,
                 );
                 if ok {
                     done.lock().unwrap().insert(off);
-                } else if !cancel.load(Ordering::SeqCst) && fatal.lock().unwrap().is_none() {
+                } else if !cancel.load(Ordering::SeqCst)
+                    && !pause_w.load(Ordering::SeqCst)
+                    && fatal.lock().unwrap().is_none()
+                {
                     // 该块没成功但未判死：放回队尾，换个时间点再抢
                     queue.lock().unwrap().push(off);
                     thread::sleep(Duration::from_millis(700));
@@ -2006,7 +2117,7 @@ pub fn run_turbo(
             save_block_state(&state_path, size, block, &done.lock().unwrap());
             last_save = now;
         }
-        if finished || cancel.load(Ordering::SeqCst) || fatal.lock().unwrap().is_some() {
+        if finished || cancel.load(Ordering::SeqCst) || pause.load(Ordering::SeqCst) || fatal.lock().unwrap().is_some() {
             break;
         }
         thread::sleep(Duration::from_millis(150));
@@ -2018,6 +2129,9 @@ pub fn run_turbo(
 
     if let Some(msg) = fatal.lock().unwrap().take() {
         return Err(EngErr::Fatal(msg));
+    }
+    if pause.load(Ordering::SeqCst) {
+        return Err(EngErr::Soft("已暂停，进度已保留".into()));
     }
     if cancel.load(Ordering::SeqCst) {
         return Err(EngErr::Soft("已取消，进度已保留".into()));
@@ -2075,13 +2189,14 @@ fn fetch_block(
     io: &IoStats,
     limiter: &Limiter,
     cancel: &AtomicBool,
+    pause: &AtomicBool,
     fatal: &Mutex<Option<String>>,
     task: &Shared,
 ) -> bool {
     let want = end - off + 1;
     let mut attempt = 0u32;
     while attempt < 6 {
-        if cancel.load(Ordering::SeqCst) {
+        if cancel.load(Ordering::SeqCst) || pause.load(Ordering::SeqCst) {
             return false;
         }
         attempt += 1;
@@ -2154,12 +2269,17 @@ fn fetch_block(
         let mut written = 0u64;
         let mut io_err = false;
         let mut slow_abort = false;
+        let mut paused = false;
         if let Some(so) = child.stdout.take() {
             let mut reader = std::io::BufReader::with_capacity(1 << 20, so);
             let mut buf = vec![0u8; 1 << 20];
             loop {
                 if cancel.load(Ordering::SeqCst) {
                     io_err = true;
+                    break;
+                }
+                if pause.load(Ordering::SeqCst) {
+                    paused = true;
                     break;
                 }
                 // 该源已被判定过慢：立即中断，把分块让给快源
@@ -2174,6 +2294,7 @@ fn fetch_block(
                         let left = want - written;
                         let take = (n as u64).min(left) as usize;
                         if take > 0 {
+                            bandwidth().throttle(take as u64);
                             let t_write = Instant::now();
                             let wres = file.seek_write(&buf[..take], off + written);
                             io.disk_ns
@@ -2201,11 +2322,18 @@ fn fetch_block(
                 }
             }
         }
-        if io_err || slow_abort {
+        if io_err || slow_abort || paused {
             let _ = child.kill();
         }
         let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
         limiter.release();
+        if paused {
+            // 这块没下完，进度要扣回去；续传时会重新下载这一块
+            if written > 0 {
+                counter.fetch_sub(written, Ordering::Relaxed);
+            }
+            return false;
+        }
         if code == 2 {
             *fatal.lock().unwrap() =
                 Some("curl 初始化失败（参数不被当前版本支持或系统资源不足）".into());
@@ -3023,6 +3151,16 @@ pub fn spawn_ext(
     ol_path: Option<String>,
     extra: BTreeMap<String, String>,
 ) {
+    // 记住启动参数：暂停后「继续」直接用同一份配置
+    if let Ok(mut t) = task.lock() {
+        t.spawn = Some(SpawnArgs {
+            dir: dir.clone(),
+            conn,
+            engine: engine.clone(),
+            ol_path: ol_path.clone(),
+            extra: extra.clone(),
+        });
+    }
     thread::spawn(move || {
         if let Ok(mut t) = task.lock() {
             t.status = Status::Running;
@@ -3068,8 +3206,17 @@ pub fn spawn_ext(
                     match run_fast(task.clone(), &url, &headers, &dir, conn) {
                         Ok(p) => Ok(p),
                         Err(EngErr::Soft(m)) => {
-                            log_line(&task, format!("{} → 改用 aria2 兜底", m));
-                            run_aria2_uri(task.clone(), &root, &url, &dir, &headers, conn, false)
+                            if task
+                                .lock()
+                                .map(|t| t.pause.load(Ordering::SeqCst))
+                                .unwrap_or(false)
+                            {
+                                // 暂停导致的退出不能触发 aria2 兜底
+                                Err(EngErr::Soft(m))
+                            } else {
+                                log_line(&task, format!("{} → 改用 aria2 兜底", m));
+                                run_aria2_uri(task.clone(), &root, &url, &dir, &headers, conn, false)
+                            }
                         }
                         Err(e) => Err(e),
                     }
@@ -3099,6 +3246,9 @@ pub fn spawn_ext(
                     if t.cancel.load(Ordering::SeqCst) {
                         t.status = Status::Cancelled;
                         t.message = "已取消".into();
+                    } else if t.pause.load(Ordering::SeqCst) {
+                        t.status = Status::Paused;
+                        t.message = "已暂停，进度已保留".into();
                     } else {
                         t.status = Status::Failed;
                         t.message = m;
@@ -3107,4 +3257,207 @@ pub fn spawn_ext(
             }
         }
     });
+}
+
+/// 暂停：置位后引擎会中断在途连接、保存分块进度并退出线程
+pub fn pause_task(task: &Shared) {
+    if let Ok(mut t) = task.lock() {
+        if t.status == Status::Running {
+            t.pause.store(true, Ordering::SeqCst);
+            t.message = "正在暂停…".into();
+        }
+    }
+}
+
+/// 继续：复用首次启动的参数重新进入下载线程，已完成的分块会跳过
+pub fn resume_task(root: PathBuf, task: Shared) {
+    let args = match task.lock() {
+        Ok(t) => t.spawn.clone(),
+        Err(_) => None,
+    };
+    let args = match args {
+        Some(a) => a,
+        None => return,
+    };
+    if let Ok(mut t) = task.lock() {
+        t.pause.store(false, Ordering::SeqCst);
+        t.cancel.store(false, Ordering::SeqCst);
+        t.status = Status::Queued;
+        t.message = "继续下载…".into();
+        t.speed = 0.0;
+        t.net_speed = 0.0;
+        t.disk_speed = 0.0;
+        t.log.push("继续下载".into());
+    }
+    spawn_ext(root, task, args.dir, args.conn, args.engine, args.ol_path, args.extra);
+}
+
+/// 取消：对已暂停（没有活动线程）的任务直接落到「已取消」
+pub fn cancel_task(task: &Shared) {
+    if let Ok(mut t) = task.lock() {
+        t.cancel.store(true, Ordering::SeqCst);
+        t.pause.store(false, Ordering::SeqCst);
+        if t.status == Status::Paused || t.status == Status::Queued {
+            t.status = Status::Cancelled;
+            t.message = "已取消".into();
+            t.speed = 0.0;
+            t.net_speed = 0.0;
+            t.disk_speed = 0.0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// 本地测试服务器：支持 Range，单连接约 2MB/s，便于在下载中途暂停
+    fn test_server(size: usize) -> (String, Vec<u8>) {
+        let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = data.clone();
+        thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut s = match conn {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let body = body.clone();
+                thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let mut start = 0usize;
+                    let mut end = body.len() - 1;
+                    let mut ranged = false;
+                    for line in req.lines() {
+                        let low = line.to_ascii_lowercase();
+                        if let Some(v) = low.strip_prefix("range: bytes=") {
+                            ranged = true;
+                            let mut it = v.trim().split('-');
+                            start = it.next().unwrap_or("").parse().unwrap_or(0);
+                            end = it
+                                .next()
+                                .and_then(|x| x.parse::<usize>().ok())
+                                .unwrap_or(body.len() - 1);
+                        }
+                    }
+                    let end = end.min(body.len() - 1);
+                    let slice = &body[start..=end];
+                    let status = if ranged { "206 Partial Content" } else { "200 OK" };
+                    let head = format!(
+                        "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        status,
+                        slice.len(),
+                        start,
+                        end,
+                        body.len()
+                    );
+                    if s.write_all(head.as_bytes()).is_err() {
+                        return;
+                    }
+                    for chunk in slice.chunks(16 * 1024) {
+                        if s.write_all(chunk).is_err() {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(8));
+                    }
+                });
+            }
+        });
+        (format!("http://{}/file.bin", addr), data)
+    }
+
+    fn wait_status(task: &Shared, want: Status, secs: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let (st, msg) = {
+                let t = task.lock().unwrap();
+                (t.status, t.message.clone())
+            };
+            if st == want {
+                return true;
+            }
+            if Instant::now() > deadline {
+                eprintln!("等待状态 {:?} 超时，当前 {:?}：{}", want, st, msg);
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 暂停 → 继续 → 完成，结果必须与源文件字节一致
+    #[test]
+    fn pause_then_resume_finishes() {
+        let (url, data) = test_server(32 * 1024 * 1024);
+        let dir = std::env::temp_dir().join(format!("dlkit-pause-{}", task_seq()));
+        let _ = fs::remove_dir_all(&dir);
+        let task: Shared = Arc::new(Mutex::new(Task::new(url, Kind::Http, "file.bin".into())));
+        spawn_ext(
+            PathBuf::from("."),
+            task.clone(),
+            dir.clone(),
+            4,
+            "auto".into(),
+            None,
+            BTreeMap::new(),
+        );
+
+        // 等到确实开始有数据，再暂停
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if task.lock().unwrap().done > 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "下载没有开始");
+            thread::sleep(Duration::from_millis(10));
+        }
+        pause_task(&task);
+        assert!(wait_status(&task, Status::Paused, 10), "暂停未生效");
+
+        resume_task(PathBuf::from("."), task.clone());
+        assert!(wait_status(&task, Status::Done, 60), "继续后未完成");
+
+        let got = fs::read(dir.join("file.bin")).expect("输出文件不存在");
+        assert_eq!(got.len(), data.len());
+        assert!(got == data, "文件内容不一致");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 全局限速大致生效
+    #[test]
+    fn speed_limit_throttles() {
+        let (url, data) = test_server(16 * 1024 * 1024);
+        let dir = std::env::temp_dir().join(format!("dlkit-limit-{}", task_seq()));
+        let _ = fs::remove_dir_all(&dir);
+        set_speed_limit(6.0);
+        let task: Shared = Arc::new(Mutex::new(Task::new(url, Kind::Http, "file.bin".into())));
+        let started = Instant::now();
+        spawn_ext(
+            PathBuf::from("."),
+            task.clone(),
+            dir.clone(),
+            4,
+            "auto".into(),
+            None,
+            BTreeMap::new(),
+        );
+        let done = wait_status(&task, Status::Done, 60);
+        let elapsed = started.elapsed().as_secs_f64();
+        set_speed_limit(0.0);
+        assert!(done, "限速下载未完成");
+        assert!(
+            elapsed >= 1.8,
+            "限速 6MB/s 下 16MB 只用了 {:.2}s，限速似乎没生效",
+            elapsed
+        );
+        let got = fs::read(dir.join("file.bin")).expect("输出文件不存在");
+        assert!(got == data, "文件内容不一致");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

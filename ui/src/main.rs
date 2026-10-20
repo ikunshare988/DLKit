@@ -65,6 +65,8 @@ struct Config {
     dir: PathBuf,
     conn: usize,
     engine: String,
+    /// 全局限速（MB/s），0 表示不限
+    limit: f64,
 }
 
 impl Default for Config {
@@ -73,6 +75,7 @@ impl Default for Config {
             dir: engine::find_root().join("downloads"),
             conn: 32,
             engine: "auto".into(),
+            limit: 0.0,
         }
     }
 }
@@ -87,6 +90,7 @@ fn load_config() -> Config {
         dir: Option<String>,
         conn: Option<usize>,
         engine: Option<String>,
+        limit: Option<f64>,
     }
     let mut cfg = Config::default();
     if let Ok(text) = std::fs::read_to_string(config_path()) {
@@ -100,6 +104,9 @@ fn load_config() -> Config {
             if let Some(e) = raw.engine {
                 cfg.engine = e;
             }
+            if let Some(l) = raw.limit {
+                cfg.limit = l.clamp(0.0, 100.0);
+            }
         }
     }
     cfg
@@ -109,7 +116,8 @@ fn save_config(cfg: &Config) {
     let v = serde_json::json!({
         "dir": cfg.dir.to_string_lossy(),
         "conn": cfg.conn,
-        "engine": cfg.engine
+        "engine": cfg.engine,
+        "limit": cfg.limit
     });
     let _ = std::fs::write(config_path(), v.to_string());
 }
@@ -129,11 +137,15 @@ struct App {
     scan: Option<scanner::ScanShared>,
     /// 用户点过「自己选」后，收起平台推荐横幅
     scan_hint_hidden: bool,
+    /// 上一次看到的剪贴板内容，用来判断是否是新复制的链接
+    clip_last: String,
+    clip_at: Instant,
 }
 
 impl App {
     fn new() -> App {
         let cfg = load_config();
+        engine::set_speed_limit(cfg.limit);
         let app = App {
             url: String::new(),
             ol_path: String::new(),
@@ -148,6 +160,9 @@ impl App {
             svc_checked: Instant::now() - Duration::from_secs(10),
             scan: None,
             scan_hint_hidden: false,
+            // 启动时已有的剪贴板内容不算「新复制」，避免一打开就自动填入
+            clip_last: clipboard_text().unwrap_or_default(),
+            clip_at: Instant::now(),
         };
         app
     }
@@ -468,6 +483,104 @@ impl App {
         self.toast = msg.into();
         self.toast_at = Instant::now();
     }
+
+    /// 复制链接后自动填入输入框。只在新复制、且输入框没有被手动改过时覆盖。
+    fn poll_clipboard(&mut self) {
+        if self.clip_at.elapsed() < Duration::from_millis(700) {
+            return;
+        }
+        self.clip_at = Instant::now();
+        let text = match clipboard_text() {
+            Some(t) => t,
+            None => return,
+        };
+        let t = text.trim().to_string();
+        if t == self.clip_last {
+            return;
+        }
+        let prev = std::mem::replace(&mut self.clip_last, t.clone());
+        if t.chars().count() > 2048 || t.contains('\n') {
+            return;
+        }
+        let is_link = t.starts_with("http://") || t.starts_with("https://") || t.starts_with("magnet:");
+        if !is_link {
+            return;
+        }
+        if self.url.trim().is_empty() || self.url == prev {
+            self.url = t;
+            self.notify("已从剪贴板填入链接");
+        }
+    }
+
+    /// 把拖进窗口的 .torrent 或链接直接加入/填入
+    fn take_dropped(&mut self, ui: &egui::Ui) {
+        let dropped: Vec<String> = ui.ctx().input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_string_lossy().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        });
+        for d in dropped {
+            let low = d.to_ascii_lowercase();
+            if low.ends_with(".torrent") {
+                self.url = d;
+                self.add_task();
+            } else if low.starts_with("http://")
+                || low.starts_with("https://")
+                || low.starts_with("magnet:")
+            {
+                self.url = d;
+                self.notify("已填入拖入的链接");
+            }
+        }
+    }
+}
+
+/// 读取 Windows 剪贴板里的文本
+#[cfg(windows)]
+fn clipboard_text() -> Option<String> {
+    extern "system" {
+        fn IsClipboardFormatAvailable(format: u32) -> i32;
+        fn OpenClipboard(hwnd: isize) -> i32;
+        fn CloseClipboard() -> i32;
+        fn GetClipboardData(format: u32) -> isize;
+        fn GlobalLock(mem: isize) -> *const u16;
+        fn GlobalUnlock(mem: isize) -> i32;
+        fn lstrlenW(s: *const u16) -> i32;
+    }
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 {
+            return None;
+        }
+        if OpenClipboard(0) == 0 {
+            return None;
+        }
+        let handle = GetClipboardData(CF_UNICODETEXT);
+        if handle == 0 {
+            CloseClipboard();
+            return None;
+        }
+        let p = GlobalLock(handle);
+        let text = if p.is_null() {
+            None
+        } else {
+            let n = lstrlenW(p);
+            let slice = std::slice::from_raw_parts(p, n.max(0) as usize);
+            let s = String::from_utf16_lossy(slice);
+            GlobalUnlock(handle);
+            Some(s)
+        };
+        CloseClipboard();
+        text
+    }
+}
+
+#[cfg(not(windows))]
+fn clipboard_text() -> Option<String> {
+    None
 }
 
 fn setup_fonts(ctx: &egui::Context) {
@@ -712,6 +825,9 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx().request_repaint_after(Duration::from_millis(80));
 
+        self.poll_clipboard();
+        self.take_dropped(ui);
+
         if self.svc_checked.elapsed() > Duration::from_secs(2) {
             self.svc_online = "127.0.0.1:6800"
                 .parse::<std::net::SocketAddr>()
@@ -846,6 +962,22 @@ impl eframe::App for App {
                                         .range(1..=64)
                                         .suffix(" 路"),
                                 );
+                            });
+                            ui.add_space(6.0);
+                            ui.label(RichText::new("限速").size(11.5).color(MUTED));
+                            ui.scope(|ui| {
+                                ui.spacing_mut().interact_size.y = 22.0;
+                                let resp = ui.add(
+                                    egui::DragValue::new(&mut self.cfg.limit)
+                                        .range(0.0..=100.0)
+                                        .speed(0.5)
+                                        .suffix(" MB/s"),
+                                );
+                                if resp.changed() {
+                                    engine::set_speed_limit(self.cfg.limit);
+                                    save_config(&self.cfg);
+                                }
+                                let _ = resp.on_hover_text("0 表示不限速；只作用于内置下载引擎");
                             });
                             ui.add_space(6.0);
                             ui.label(RichText::new("目录").size(11.5).color(MUTED));
@@ -1009,6 +1141,7 @@ impl eframe::App for App {
                                         let (tag, fg, bg) = match snap.status {
                                             Status::Queued => ("排队", SECONDARY, PANEL),
                                             Status::Running => ("下载中", PRIMARY, tint(PRIMARY, 26)),
+                                            Status::Paused => ("已暂停", SECONDARY, BUBBLE),
                                             Status::Done => ("完成", SUCCESS, SUCCESS_BG),
                                             Status::Failed => ("失败", DANGER, DANGER_BG),
                                             Status::Cancelled => ("已取消", MUTED, PANEL),
@@ -1022,13 +1155,24 @@ impl eframe::App for App {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                if snap.status == Status::Running
-                                                    && ui.button("取消").clicked()
-                                                {
-                                                    if let Ok(t) = task.lock() {
-                                                        t.cancel.store(
-                                                            true,
-                                                            std::sync::atomic::Ordering::SeqCst,
+                                                // 暂停/继续只对内置引擎生效，aria2 任务交给它自己调度
+                                                let pausable = self.cfg.engine != "aria2"
+                                                    && snap.kind == engine::Kind::Http;
+                                                if snap.status == Status::Running {
+                                                    if ui.button("取消").clicked() {
+                                                        engine::cancel_task(task);
+                                                    }
+                                                    if pausable && ui.button("暂停").clicked() {
+                                                        engine::pause_task(task);
+                                                    }
+                                                } else if snap.status == Status::Paused {
+                                                    if ui.button("取消").clicked() {
+                                                        engine::cancel_task(task);
+                                                    }
+                                                    if ui.button("继续").clicked() {
+                                                        engine::resume_task(
+                                                            self.root.clone(),
+                                                            task.clone(),
                                                         );
                                                     }
                                                 }

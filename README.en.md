@@ -53,6 +53,9 @@ Start:
 - Files are split into blocks and fetched concurrently (default 32 connections, 1–64 in the UI)
 - Space is preallocated and every block is written straight to its offset — no temp files, no merge step
 - Resume: re-add the same link and finished blocks are skipped
+- Pause / resume: in-flight connections are dropped and block progress is saved; resume only fetches what is missing
+- Global speed limit from 0 to 100 MB/s (0 = unlimited; applies to the built-in engine)
+- Copying a link fills the input box; links and `.torrent` files can be dropped onto the window
 - Falls back to a single connection when the server ignores Range requests
 - Real file names via redirects and `Content-Disposition`
 - 429/403 back off and lower concurrency; 404/410 fail fast instead of retrying
