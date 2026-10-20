@@ -8,10 +8,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use reqwest::header::{ACCEPT_ENCODING, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
@@ -1982,6 +1984,933 @@ pub fn run_fast(
     Ok(out_path)
 }
 
+// ---------------- 常驻连接池下载器 ----------------
+//
+// 与 run_fast 的区别：所有连接共用一个 reqwest 客户端（keep-alive / HTTP/2），
+// 不再「每个分块起一个 curl 进程」。带来三点：
+//   1. 没有重复握手，起步快、吞吐稳；
+//   2. 段内可按字节切分：慢连接只交出「还没下的那半段」，已写字节不重下；
+//   3. 预留 1.25× 的连接，速度掉下来时备用连接立即接手（不用等握手）。
+
+const POOL_MIN_SEG: u64 = 1 << 20;
+const POOL_MAX_SEG: u64 = 8 << 20;
+const POOL_UNIT_LIMIT: u64 = 262_144;
+
+fn pool_seg(size: u64, conns: usize) -> u64 {
+    let lanes = (conns as u64 * 4).max(1);
+    (size / lanes)
+        .clamp(POOL_MIN_SEG, POOL_MAX_SEG)
+        .min(size.max(1))
+}
+
+/// 续传粒度：1MB 起，超大文件自动放大，避免出现几十万个单元
+fn pool_unit(size: u64) -> u64 {
+    let mut unit = POOL_MIN_SEG;
+    while size / unit > POOL_UNIT_LIMIT {
+        unit <<= 1;
+    }
+    unit.min(size.max(1))
+}
+
+fn pool_client(conns: usize) -> Result<reqwest::blocking::Client, EngErr> {
+    reqwest::blocking::Client::builder()
+        .pool_max_idle_per_host(conns.max(1) + 8)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_nodelay(true)
+        .connect_timeout(Duration::from_secs(15))
+        // 单个分段请求的总时限：8MB 段至少 133KB/s 才算合格，
+        // 卡死的连接会被中断，worker 从断点继续（不重下已写字节）
+        .timeout(Duration::from_secs(60))
+        .user_agent(DEFAULT_UA)
+        .build()
+        .map_err(|e| EngErr::Fatal(format!("初始化 HTTP 连接池失败：{}", e)))
+}
+
+fn pool_request(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    headers: &BTreeMap<String, String>,
+    start: u64,
+    end: u64,
+) -> reqwest::blocking::RequestBuilder {
+    let mut rb = client
+        .get(url)
+        .header(ACCEPT_ENCODING, "identity")
+        .header(RANGE, format!("bytes={}-{}", start, end));
+    for (k, v) in headers {
+        let kl = k.to_ascii_lowercase();
+        if kl == "range" || kl == "accept-encoding" || kl == "host" {
+            continue;
+        }
+        rb = rb.header(k.as_str(), v.as_str());
+    }
+    rb
+}
+
+fn cd_name(cd: &str) -> Option<String> {
+    cd.split(';').find_map(|seg| {
+        let seg = seg.trim();
+        seg.strip_prefix("filename=")
+            .map(|v| v.trim_matches('"').to_string())
+    })
+}
+
+/// 把 reqwest 的错误链展开：只看第一层通常只有一句「error sending request」
+fn err_chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut cur = e.source();
+    while let Some(src) = cur {
+        s.push_str(": ");
+        s.push_str(&src.to_string());
+        cur = src.source();
+    }
+    s
+}
+
+/// 把「未完成的单元」合并成下载段，每段不超过 seg
+fn build_ranges(size: u64, unit: u64, seg: u64, done: &BTreeSet<u64>) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut i = 0u64;
+    while i * unit < size {
+        let u_start = i * unit;
+        if done.contains(&u_start) {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j * unit < size && !done.contains(&(j * unit)) {
+            j += 1;
+        }
+        let run_end = (j * unit).min(size) - 1;
+        let mut s = u_start;
+        while s <= run_end {
+            let e = (s + seg - 1).min(run_end);
+            out.push((s, e));
+            s = e + 1;
+        }
+        i = j;
+    }
+    out
+}
+
+struct PoolCtx {
+    client: reqwest::blocking::Client,
+    sources: Arc<Sources>,
+    headers: BTreeMap<String, String>,
+    file: Arc<File>,
+    counter: Arc<AtomicU64>,
+    counts: Vec<AtomicU32>,
+    unit: u64,
+    size: u64,
+    seg: u64,
+    min_split: u64,
+    io: Arc<IoStats>,
+    limiter: Arc<Limiter>,
+    cancel: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
+    shutdown: AtomicBool,
+    fatal: Arc<Mutex<Option<String>>>,
+    task: Shared,
+    queue: Mutex<Vec<(u64, u64)>>,
+    done: Mutex<BTreeSet<u64>>,
+    /// 活跃流的中位速度（KB/s），用于判断「这条流是不是明显拖后腿」
+    median: AtomicU32,
+    /// 每条流的当前速度（KB/s），下标即 worker 槽位
+    rates: Vec<AtomicU32>,
+    /// 允许启动的备用连接数（spare 线程取走一个就转正）
+    spare_permits: AtomicUsize,
+    spare_started: AtomicUsize,
+    extra: usize,
+    active: AtomicUsize,
+    fails: AtomicUsize,
+    head_bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl PoolCtx {
+    fn stop(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+            || self.pause.load(Ordering::SeqCst)
+            || self.shutdown.load(Ordering::SeqCst)
+            || self.fatal.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    fn fail(&self, msg: impl Into<String>) {
+        if let Ok(mut g) = self.fatal.lock() {
+            if g.is_none() {
+                *g = Some(msg.into());
+            }
+        }
+    }
+
+    /// 写入一段数据，并按单元累计完成度
+    fn add_written(&self, off: u64, n: u64) {
+        self.counter.fetch_add(n, Ordering::Relaxed);
+        let mut pos = off;
+        let end = (off + n).min(self.size);
+        while pos < end {
+            let u = (pos / self.unit) as usize;
+            let u_start = u as u64 * self.unit;
+            let u_end = (u_start + self.unit).min(self.size);
+            let seg_end = end.min(u_end);
+            let add = (seg_end - pos) as u32;
+            if let Some(c) = self.counts.get(u) {
+                let prev = c.fetch_add(add, Ordering::Relaxed);
+                if prev as u64 + add as u64 >= u_end - u_start {
+                    if let Ok(mut d) = self.done.lock() {
+                        d.insert(u_start);
+                    }
+                }
+            }
+            pos = seg_end;
+        }
+    }
+
+    /// 启用一条备用连接（已有预热好的 TCP/TLS 连接在池子里等）
+    fn activate_spare(&self, why: &str) {
+        let started = self.spare_started.fetch_add(1, Ordering::Relaxed);
+        if started >= self.extra {
+            self.spare_started.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+        self.spare_permits.fetch_add(1, Ordering::Relaxed);
+        log_line(&self.task, format!("启用备用连接：{}", why));
+    }
+
+    /// 下载 [off, end]；成功返回 true。失败时把剩余区间放回队列。
+    fn fetch_range(&self, mut off: u64, mut end: u64, slot: usize) -> bool {
+        if let Some(r) = self.rates.get(slot) {
+            r.store(0, Ordering::Relaxed);
+        }
+        let mut attempt = 0u32;
+        let mut splits = 0u32;
+        while off <= end {
+            if self.stop() {
+                return false;
+            }
+            if self.fails.load(Ordering::Relaxed) > 60 {
+                self.fail("多次重试仍失败：网络不稳或站点限流");
+                return false;
+            }
+            attempt += 1;
+            if attempt > 6 {
+                self.queue.lock().unwrap().push((off, end));
+                self.fails.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            let (src_idx, src) = match self.sources.pick((off / self.seg) as usize, attempt - 1) {
+                Some(x) => x,
+                None => {
+                    self.fail("所有下载源都不可用");
+                    return false;
+                }
+            };
+            self.sources.begin(src_idx);
+            let t0 = Instant::now();
+            let start_off = off;
+            let resp = pool_request(&self.client, &src, &self.headers, off, end).send();
+            let mut reader = match resp {
+                Ok(r) => {
+                    let code = r.status().as_u16();
+                    if matches!(code, 401 | 404 | 410) {
+                        self.sources.end(src_idx);
+                        self.fail(status_text(code));
+                        return false;
+                    }
+                    if code == 403 || code == 429 || code >= 500 {
+                        self.sources.end(src_idx);
+                        if src_idx > 0 {
+                            self.sources.mark_bad(src_idx);
+                        }
+                        if code == 429 {
+                            let cap = self.limiter.cap();
+                            if cap > 4 {
+                                self.limiter.shrink(cap * 3 / 4);
+                            }
+                        }
+                        thread::sleep(Duration::from_millis(400 * (attempt as u64).min(4)));
+                        continue;
+                    }
+                    if code != 206 && !(code == 200 && off == 0) {
+                        self.sources.end(src_idx);
+                        thread::sleep(Duration::from_millis(300));
+                        continue;
+                    }
+                    r
+                }
+                Err(e) => {
+                    self.sources.end(src_idx);
+                    if src_idx > 0 {
+                        self.sources.mark_bad(src_idx);
+                    }
+                    self.fails.fetch_add(1, Ordering::Relaxed);
+                    log_line(
+                        &self.task,
+                        format!("分块 {}–{} 连接失败：{}", off, end, err_chain(&e)),
+                    );
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+            };
+
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut next_probe = 512 * 1024u64;
+            let mut net_err = false;
+            loop {
+                if self.stop() {
+                    self.sources.end(src_idx);
+                    return false;
+                }
+                if src_idx > 0 && self.sources.is_slow(src_idx) {
+                    net_err = true;
+                    break;
+                }
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let want = end - off + 1;
+                        let take = (n as u64).min(want) as usize;
+                        if take == 0 {
+                            break;
+                        }
+                        bandwidth().throttle(take as u64);
+                        let tw = Instant::now();
+                        if self.file.seek_write(&buf[..take], off).is_err() {
+                            self.sources.end(src_idx);
+                            self.fail("写入磁盘失败");
+                            return false;
+                        }
+                        self.io
+                            .disk_ns
+                            .fetch_add(tw.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        self.io
+                            .disk_bytes
+                            .fetch_add(take as u64, Ordering::Relaxed);
+                        self.add_written(off, take as u64);
+                        self.sources.note_bytes(src_idx, take as u64);
+                        off += take as u64;
+
+                        let written = off - start_off;
+                        if written >= next_probe {
+                            next_probe = written + (512 << 10);
+                            let secs = t0.elapsed().as_secs_f64().max(0.001);
+                            let kbps = (written as f64 / secs / 1024.0) as u32;
+                            if let Some(r) = self.rates.get(slot) {
+                                r.store(kbps, Ordering::Relaxed);
+                            }
+                            let med = self.median.load(Ordering::Relaxed);
+                            // 单流明显拖后腿：把剩余区间从中间切开交给别的连接，
+                            // 自己继续前半段；已写字节不重下（对应「末期慢」问题）。
+                            // 末期只剩少数几条流时，不看速度也切：反正空闲连接多，
+                            // 多切几段总比一条 0.07MB/s 的连接磨完最后 1MB 快。
+                            let active_now = self.active.load(Ordering::Relaxed);
+                            let tail = active_now <= 4;
+                            let floor = if tail { 256 << 10 } else { self.min_split };
+                            let limit = if tail { 6 } else { 2 };
+                            let slow = if tail {
+                                true
+                            } else {
+                                med > 0 && (kbps as f64) < med as f64 * 0.4
+                            };
+                            if splits < limit && secs >= 1.0 && end > off + floor && slow {
+                                let mid = off + (end - off) / 2;
+                                self.queue.lock().unwrap().push((mid + 1, end));
+                                end = mid;
+                                splits += 1;
+                                let why = format!(
+                                    "单流 {:.2} MB/s 低于中位 {:.2} MB/s，剩余段切半",
+                                    kbps as f64 / 1024.0,
+                                    med as f64 / 1024.0
+                                );
+                                self.activate_spare(&why);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        net_err = true;
+                        break;
+                    }
+                }
+            }
+            self.sources.end(src_idx);
+            if off > end {
+                self.sources.prove(src_idx);
+                if let Some(r) = self.rates.get(slot) {
+                    r.store(0, Ordering::Relaxed);
+                }
+                return true;
+            }
+            if off > start_off {
+                // 有进展就重置重试计数，从断点继续
+                attempt = 0;
+                if net_err {
+                    self.fails.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
+            if net_err {
+                self.fails.fetch_add(1, Ordering::Relaxed);
+            }
+            thread::sleep(Duration::from_millis(300));
+        }
+        true
+    }
+}
+
+/// 连接池版直链下载：探测与首段合并、段内动态切分、备用连接接管
+pub fn run_pool(
+    task: Shared,
+    url: &str,
+    headers: &BTreeMap<String, String>,
+    out_dir: &Path,
+    conn: usize,
+) -> Result<PathBuf, EngErr> {
+    let _ = fs::create_dir_all(out_dir);
+    let pause = task
+        .lock()
+        .map(|t| t.pause.clone())
+        .unwrap_or_else(|_| Arc::new(AtomicBool::new(false)));
+    let cancel = task
+        .lock()
+        .map(|t| t.cancel.clone())
+        .unwrap_or_else(|_| Arc::new(AtomicBool::new(false)));
+
+    let conn = conn.max(1);
+    let extra = ((conn as f64 * 0.25).ceil() as usize).max(1).min(16);
+    let client = pool_client(conn + extra)?;
+
+    let name0 = pick_name(out_dir, &sanitize_name(&filename_from_url(url)), None);
+    let mut out_path = out_dir.join(&name0);
+    let state_path = out_dir.join(format!("{}.dlkit.json", name0));
+
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
+    struct State {
+        size: u64,
+        block: u64,
+        done: Vec<u64>,
+    }
+    let prev: State = fs::read_to_string(&state_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<State>(&s).ok())
+        .unwrap_or_default();
+
+    // 首段请求：同时完成「探测大小」和「下载第一段」，不给握手多付一次时间
+    let mut resp = pool_request(&client, url, headers, 0, POOL_MAX_SEG - 1)
+        .send()
+        .map_err(|e| EngErr::Soft(format!("连接失败：{}", err_chain(&e))))?;
+    let code = resp.status().as_u16();
+    if matches!(code, 401 | 404 | 410) || code == 403 {
+        return Err(if matches!(code, 401 | 404 | 410) {
+            EngErr::Fatal(status_text(code))
+        } else {
+            EngErr::Soft(status_text(code))
+        });
+    }
+    if code >= 400 {
+        return Err(EngErr::Soft(status_text(code)));
+    }
+    let final_url = resp.url().to_string();
+    let head = resp.headers().clone();
+    let ranges = code == 206;
+    let size = if ranges {
+        head.get(CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit('/').next())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    } else {
+        head.get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    if ranges && size == 0 {
+        return Err(EngErr::Soft("无法从 Content-Range 获取文件大小".into()));
+    }
+
+    let name = head
+        .get(CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(cd_name)
+        .unwrap_or_else(|| filename_from_url(&final_url));
+    let final_name = pick_name(out_dir, &sanitize_name(&name), Some(&out_path));
+    if let Ok(mut t) = task.lock() {
+        if size > 0 {
+            t.total = size;
+        }
+        if t.name.is_empty() || t.name == "解析中…" {
+            t.name = final_name.clone();
+        }
+    }
+
+    let file = Arc::new(
+        OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&out_path)
+            .map_err(|e| EngErr::Fatal(format!("无法创建目标文件：{}", e)))?,
+    );
+
+    // 不支持 Range：当前这条连接就是单连接下载，边读边写
+    if !ranges || size == 0 {
+        if let Ok(mut t) = task.lock() {
+            t.message = "单连接下载中…".into();
+        }
+        log_line(&task, "目标不支持分片，单连接下载".into());
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut off = 0u64;
+        let mut last = Instant::now();
+        let mut last_off = 0u64;
+        loop {
+            if cancel.load(Ordering::SeqCst) || pause.load(Ordering::SeqCst) {
+                return Err(EngErr::Soft("已中断，进度已保留".into()));
+            }
+            match resp.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    bandwidth().throttle(n as u64);
+                    if file.seek_write(&buf[..n], off).is_err() {
+                        return Err(EngErr::Fatal("写入磁盘失败".into()));
+                    }
+                    off += n as u64;
+                    if last.elapsed() >= Duration::from_millis(300) {
+                        let secs = last.elapsed().as_secs_f64().max(0.001);
+                        let sp = (off - last_off) as f64 / 1048576.0 / secs;
+                        set_progress(&task, off, size.max(off), sp);
+                        last = Instant::now();
+                        last_off = off;
+                    }
+                }
+                Err(e) => return Err(EngErr::Soft(format!("下载中断：{}", e))),
+            }
+        }
+        let got = off;
+        if got == 0 {
+            return Err(EngErr::Soft("没有收到任何数据".into()));
+        }
+        if size > 0 && got != size {
+            return Err(EngErr::Soft(format!(
+                "收到 {} / {} 字节，可能被站点中断",
+                got, size
+            )));
+        }
+        set_progress(&task, got, got.max(size), 0.0);
+        drop(file);
+        if final_name != name0 {
+            out_path = rename_out(&out_path, out_dir, &final_name);
+        }
+        return Ok(out_path);
+    }
+
+    if file.metadata().map(|m| m.len()).unwrap_or(0) != size {
+        ensure_space(out_dir, size)?;
+        file.set_len(size)
+            .map_err(|e| EngErr::Fatal(format!("预分配磁盘空间失败：{}", e)))?;
+    }
+
+    let unit = pool_unit(size);
+    let seg = pool_seg(size, conn);
+    let min_split = (seg / 4).max(1 << 20);
+    let units = ((size + unit - 1) / unit) as usize;
+    let done: BTreeSet<u64> = if prev.size == size && prev.block == unit {
+        prev.done.into_iter().filter(|o| *o < size).collect()
+    } else {
+        BTreeSet::new()
+    };
+    let base: u64 = done
+        .iter()
+        .map(|&o| (o + unit).min(size) - o)
+        .sum();
+    let counts: Vec<AtomicU32> = (0..units)
+        .map(|i| {
+            let u_start = i as u64 * unit;
+            let len = ((u_start + unit).min(size) - u_start) as u32;
+            let full = done.contains(&u_start);
+            AtomicU32::new(if full { len } else { 0 })
+        })
+        .collect();
+    let counter = Arc::new(AtomicU64::new(base));
+
+    let boot_end = (POOL_MAX_SEG - 1).min(size - 1);
+    let boot_done = (0..=boot_end / unit).all(|u| done.contains(&(u * unit)));
+    let mut queue = build_ranges(size, unit, seg, &done);
+    if !boot_done {
+        // 首段由已经打开的那条连接负责，别让 worker 重复下
+        queue.retain_mut(|(s, e)| {
+            if *s <= boot_end {
+                *s = boot_end + 1;
+            }
+            *s <= *e
+        });
+    }
+
+    // 镜像：校验通过后逐个加入（首段数据流会顺带填好比对用的开头字节）
+    let cands = if size >= 4 << 20 && std::env::var("DLKIT_NO_MIRROR").is_err() {
+        mirror_candidates_for(&[url, final_url.as_str()])
+    } else {
+        Vec::new()
+    };
+    let sources = Arc::new(Sources::new(final_url.clone(), cands.len()));
+    let head_bytes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    for (i, curl_url) in cands.into_iter().enumerate() {
+        let sources_v = sources.clone();
+        let headers_v = headers.clone();
+        let head_v = head_bytes.clone();
+        let task_v = task.clone();
+        thread::spawn(move || {
+            if let Ok(()) = verify_mirror(&curl_url, size, &headers_v, &head_v) {
+                sources_v.set_url(i + 1, curl_url.clone());
+                log_line(
+                    &task_v,
+                    format!(
+                        "镜像已加入：{}（{} 源并行下载）",
+                        host_of(&curl_url).unwrap_or_else(|| curl_url.clone()),
+                        sources_v.ready()
+                    ),
+                );
+            }
+        });
+    }
+
+    if let Ok(mut t) = task.lock() {
+        t.message = format!("{} 路连接池下载中…", conn);
+    }
+    log_line(
+        &task,
+        format!(
+            "{} 个分块 × {:.2} MB，连接池 {} + 备用 {}",
+            queue.len() + if boot_done { 0 } else { 1 },
+            seg as f64 / 1048576.0,
+            conn,
+            extra
+        ),
+    );
+
+    let ctx = Arc::new(PoolCtx {
+        client,
+        sources,
+        headers: headers.clone(),
+        file: file.clone(),
+        counter: counter.clone(),
+        counts,
+        unit,
+        size,
+        seg,
+        min_split,
+        io: Arc::new(IoStats::default()),
+        limiter: Arc::new(Limiter::new(conn)),
+        cancel: cancel.clone(),
+        pause: pause.clone(),
+        shutdown: AtomicBool::new(false),
+        fatal: Arc::new(Mutex::new(None)),
+        task: task.clone(),
+        queue: Mutex::new(queue),
+        done: Mutex::new(done),
+        median: AtomicU32::new(0),
+        rates: (0..conn + extra).map(|_| AtomicU32::new(0)).collect(),
+        spare_permits: AtomicUsize::new(0),
+        spare_started: AtomicUsize::new(0),
+        extra,
+        active: AtomicUsize::new(0),
+        fails: AtomicUsize::new(0),
+        head_bytes: head_bytes.clone(),
+    });
+
+    // 首段：已经在传的这条连接直接写进文件
+    let boot = {
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            if boot_done {
+                return;
+            }
+            let mut off = 0u64;
+            let mut end = boot_end;
+            let t0 = Instant::now();
+            let mut next_probe = 2u64 << 20;
+            let mut splits = 0u32;
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                if ctx.stop() {
+                    break;
+                }
+                match resp.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let take = (n as u64).min(end - off + 1) as usize;
+                        if take == 0 {
+                            break;
+                        }
+                        bandwidth().throttle(take as u64);
+                        let tw = Instant::now();
+                        if ctx.file.seek_write(&buf[..take], off).is_err() {
+                            ctx.fail("写入磁盘失败");
+                            break;
+                        }
+                        ctx.io
+                            .disk_ns
+                            .fetch_add(tw.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        ctx.io
+                            .disk_bytes
+                            .fetch_add(take as u64, Ordering::Relaxed);
+                        if off < 1024 {
+                            if let Ok(mut h) = ctx.head_bytes.lock() {
+                                if h.len() < 1024 {
+                                    let from = (h.len() as u64).saturating_sub(off) as usize;
+                                    if from < take {
+                                        h.extend_from_slice(&buf[from..take]);
+                                    }
+                                }
+                            }
+                        }
+                        ctx.add_written(off, take as u64);
+                        off += take as u64;
+                        if take < n {
+                            break;
+                        }
+                        // 首段自己也可能落在慢连接上：剩余部分切一半出去
+                        if off >= next_probe {
+                            next_probe = off + (2 << 20);
+                            let secs = t0.elapsed().as_secs_f64().max(0.001);
+                            let kbps = (off as f64 / secs / 1024.0) as u32;
+                            let med = ctx.median.load(Ordering::Relaxed);
+                            let tail = ctx.active.load(Ordering::Relaxed) <= 4;
+                            let floor = if tail { 256 << 10 } else { ctx.min_split };
+                            let limit = if tail { 6 } else { 2 };
+                            let slow = if tail {
+                                true
+                            } else {
+                                med > 0 && (kbps as f64) < med as f64 * 0.4
+                            };
+                            if splits < limit && end > off + floor && slow {
+                                let mid = off + (end - off) / 2;
+                                ctx.queue.lock().unwrap().push((mid + 1, end));
+                                end = mid;
+                                splits += 1;
+                                ctx.activate_spare("首段偏慢，剩余段切半");
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+
+    let mut handles = Vec::new();
+    for id in 0..conn + extra {
+        let ctx = ctx.clone();
+        let is_spare = id >= conn;
+        handles.push(thread::spawn(move || {
+            if is_spare {
+                // 备用连接：等许可。连接本身已经预热在池子里，转正即可开工
+                while !ctx.stop() {
+                    if ctx.spare_permits.load(Ordering::Relaxed) > 0
+                        && !ctx.queue.lock().unwrap().is_empty()
+                    {
+                        ctx.spare_permits.fetch_sub(1, Ordering::Relaxed);
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(60));
+                }
+                if ctx.stop() {
+                    return;
+                }
+            }
+            let mut idle_from: Option<Instant> = None;
+            loop {
+                if ctx.stop() {
+                    return;
+                }
+                // 先占一个「在途」名额再取活：监视线程据此判断是否还有人在干活
+                ctx.active.fetch_add(1, Ordering::Relaxed);
+                let next = ctx.queue.lock().unwrap().pop();
+                let (s, e) = match next {
+                    Some(x) => {
+                        idle_from = None;
+                        x
+                    }
+                    None => {
+                        ctx.active.fetch_sub(1, Ordering::Relaxed);
+                        if ctx.shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        // 队列暂时空了先别走：末期还会切出新段，留着接活
+                        let t0 = *idle_from.get_or_insert_with(Instant::now);
+                        if t0.elapsed() > Duration::from_millis(1500) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                };
+                ctx.fetch_range(s, e, id);
+                ctx.active.fetch_sub(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    // 备用连接预热：先把 TCP/TLS 建好放进池子，需要时直接开工，不再等握手
+    if ranges && extra > 0 {
+        let ctx_w = ctx.clone();
+        let url_w = final_url.clone();
+        let headers_w = headers.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            let mut hs = Vec::new();
+            for _ in 0..ctx_w.extra {
+                let client = ctx_w.client.clone();
+                let url = url_w.clone();
+                let headers = headers_w.clone();
+                hs.push(thread::spawn(move || {
+                    if let Ok(mut r) = pool_request(&client, &url, &headers, 0, 0).send() {
+                        let mut b = [0u8; 1];
+                        let _ = r.read(&mut b);
+                    }
+                }));
+            }
+            for h in hs {
+                let _ = h.join();
+            }
+        });
+    }
+
+    // 监视：进度、速度、中位数、备用触发、状态落盘
+    let mut last_done = counter.load(Ordering::Relaxed);
+    let mut last_t = Instant::now();
+    let mut speed = 0.0f64;
+    let mut peak = 0.0f64;
+    let mut low_streak = 0u32;
+    let mut last_save = Instant::now();
+    let mut last_median = Instant::now();
+    let mut smooth_disk = 0.0f64;
+    let mut snap = (0u64, 0u64);
+    loop {
+        let now = Instant::now();
+        let cur = counter.load(Ordering::Relaxed).min(size);
+        let dt = now.duration_since(last_t).as_secs_f64();
+        if dt >= 0.3 {
+            let inst = cur.saturating_sub(last_done) as f64 / 1048576.0 / dt;
+            speed = if speed == 0.0 {
+                inst
+            } else {
+                speed * 0.65 + inst * 0.35
+            };
+            set_progress(&task, cur, size, speed);
+
+            let db = ctx.io.disk_bytes.load(Ordering::Relaxed);
+            let dn = ctx.io.disk_ns.load(Ordering::Relaxed);
+            let disk_inst = if dn > snap.1 && db >= snap.0 {
+                (db - snap.0) as f64 / ((dn - snap.1) as f64 / 1e9) / 1048576.0
+            } else {
+                smooth_disk
+            };
+            smooth_disk = if smooth_disk == 0.0 {
+                disk_inst
+            } else {
+                smooth_disk * 0.6 + disk_inst * 0.4
+            };
+            snap = (db, dn);
+            set_io(&task, speed, smooth_disk);
+            if speed > peak {
+                peak = speed;
+            }
+            last_done = cur;
+            last_t = now;
+        }
+        if now.duration_since(last_median) >= Duration::from_secs(1) {
+            last_median = now;
+            let mut v: Vec<u32> = ctx
+                .rates
+                .iter()
+                .map(|r| r.load(Ordering::Relaxed))
+                .filter(|v| *v > 0)
+                .collect();
+            if !v.is_empty() {
+                v.sort_unstable();
+                ctx.median.store(v[v.len() / 2], Ordering::Relaxed);
+            }
+            // 多源：明显慢于最快源的镜像不再分配新分块
+            let ready = ctx.sources.ready_flags();
+            if ready.iter().filter(|r| **r).count() > 1 {
+                let speeds: Vec<f64> = (0..ready.len())
+                    .map(|i| if ready[i] { ctx.sources.speed_of(i) } else { 0.0 })
+                    .collect();
+                let fastest = speeds.iter().cloned().fold(0.0f64, f64::max);
+                if fastest >= 0.5 {
+                    for i in 1..speeds.len() {
+                        if ready[i]
+                            && speeds[i] > 0.0
+                            && speeds[i] < fastest * 0.25
+                            && ctx.sources.mark_slow(i)
+                        {
+                            log_line(
+                                &ctx.task,
+                                format!("镜像过慢（{:.2} MB/s），不再使用", speeds[i]),
+                            );
+                        }
+                    }
+                }
+            }
+            // 整体吞吐明显低于峰值、且还有排队分块时，才启用备用
+            let pending = !ctx.queue.lock().unwrap().is_empty();
+            if pending && peak > 2.0 && speed < peak * 0.6 {
+                low_streak += 1;
+            } else {
+                low_streak = 0;
+            }
+            if pending && low_streak >= 2 {
+                low_streak = 0;
+                let why = format!("整体 {:.2} MB/s 低于峰值 {:.2} MB/s", speed, peak);
+                ctx.activate_spare(&why);
+            }
+        }
+        if now.duration_since(last_save) >= Duration::from_secs(2) {
+            last_save = now;
+            save_block_state(&state_path, size, unit, &ctx.done.lock().unwrap());
+        }
+
+        let idle = ctx.queue.lock().unwrap().is_empty()
+            && ctx.active.load(Ordering::Relaxed) == 0
+            && boot.is_finished();
+        if idle || ctx.stop() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(120));
+    }
+
+    ctx.shutdown.store(true, Ordering::SeqCst);
+    let _ = boot.join();
+    for h in handles {
+        let _ = h.join();
+    }
+    save_block_state(&state_path, size, unit, &ctx.done.lock().unwrap());
+
+    if let Some(msg) = ctx.fatal.lock().unwrap().take() {
+        return Err(EngErr::Fatal(msg));
+    }
+    if pause.load(Ordering::SeqCst) {
+        return Err(EngErr::Soft("已暂停，进度已保留".into()));
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return Err(EngErr::Soft("已取消，进度已保留".into()));
+    }
+    let finished = ctx.done.lock().unwrap().len();
+    if finished < units {
+        return Err(EngErr::Soft(format!(
+            "已完成 {}/{} 块，进度已保留，重新运行可续传",
+            finished, units
+        )));
+    }
+    let _ = fs::remove_file(&state_path);
+    set_progress(&task, size, size, 0.0);
+    drop(file);
+    drop(ctx);
+    if final_name != name0 {
+        out_path = rename_out(&out_path, out_dir, &final_name);
+    }
+    Ok(out_path)
+}
+
 fn rename_out(from: &Path, dir: &Path, final_name: &str) -> PathBuf {
     let mut target = dir.join(final_name);
     if target == from {
@@ -3316,23 +4245,56 @@ pub fn spawn_ext(
             Kind::OpenList => run_openlist(task.clone(), &root, &url, &dir, conn, ol_path),
             Kind::Http => {
                 let headers = with_extra(default_headers());
+                let paused = |t: &Shared| {
+                    t.lock()
+                        .map(|x| x.pause.load(Ordering::SeqCst))
+                        .unwrap_or(false)
+                };
+                let progressed = |t: &Shared| t.lock().map(|x| x.done).unwrap_or(0) > 0;
                 if engine == "aria2" {
                     run_aria2_uri(task.clone(), &root, &url, &dir, &headers, conn, false)
-                } else {
-                    // 探测与首块下载合并，登录/重定向的成本不再单独等待
+                } else if std::env::var("DLKIT_LEGACY_ENGINE").is_ok() {
+                    // 旧路径：每块一个 curl 进程（保留一个开关便于对照）
                     match run_fast(task.clone(), &url, &headers, &dir, conn) {
                         Ok(p) => Ok(p),
                         Err(EngErr::Soft(m)) => {
-                            if task
-                                .lock()
-                                .map(|t| t.pause.load(Ordering::SeqCst))
-                                .unwrap_or(false)
-                            {
-                                // 暂停导致的退出不能触发 aria2 兜底
+                            if paused(&task) {
                                 Err(EngErr::Soft(m))
                             } else {
                                 log_line(&task, format!("{} → 改用 aria2 兜底", m));
                                 run_aria2_uri(task.clone(), &root, &url, &dir, &headers, conn, false)
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    match run_pool(task.clone(), &url, &headers, &dir, conn) {
+                        Ok(p) => Ok(p),
+                        // 一点数据都没下到才回退，避免把已有进度作废
+                        Err(EngErr::Soft(m)) if !paused(&task) && !progressed(&task) => {
+                            log_line(&task, format!("连接池直连失败（{}），改用分片引擎", m));
+                            match run_fast(task.clone(), &url, &headers, &dir, conn) {
+                                Ok(p) => Ok(p),
+                                Err(EngErr::Soft(m2)) => {
+                                    if paused(&task) {
+                                        Err(EngErr::Soft(m2))
+                                    } else {
+                                        log_line(
+                                            &task,
+                                            format!("{} → 改用 aria2 兜底", m2),
+                                        );
+                                        run_aria2_uri(
+                                            task.clone(),
+                                            &root,
+                                            &url,
+                                            &dir,
+                                            &headers,
+                                            conn,
+                                            false,
+                                        )
+                                    }
+                                }
+                                Err(e) => Err(e),
                             }
                         }
                         Err(e) => Err(e),
