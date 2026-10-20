@@ -198,7 +198,9 @@ Copy `config/policy.example.json` to `config/policy.json`; reload it from Settin
 ### While downloading
 
 - Network throughput and disk write speed are shown separately
-- The log panel records every retry and source switch
+- The log panel has two tabs, Program and Task, both timestamped
+- Program logs cover startup, paths, parameters, dependencies, aria2 status, accounts, policy and update checks through initialization, and can be copied in one click
+- Task logs record the probe result (HTTP status, range support, size, final URL), resume state, pool parameters, retries and source switches, plus final duration and average speed
 - If a domain resolves to 127.0.0.1 via hosts, the app says so and explains it may be a block or an accelerator that is not active
 
 ## Command line

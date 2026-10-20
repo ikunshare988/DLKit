@@ -234,6 +234,10 @@ struct App {
     diag_checks: Option<Vec<diag::Check>>,
     /// 上次异常退出的日志，提示过一次后清空
     crash_log: Option<PathBuf>,
+    /// 程序启动以来的日志（启动、初始化、运行时事件）
+    boot_at: Instant,
+    app_log: Vec<String>,
+    log_tab: LogTab,
     /// 已经安排过安全检查的文件（按路径去重）
     av_scanned: std::collections::HashSet<PathBuf>,
     /// 云端信誉配置（VirusTotal，可选）
@@ -271,6 +275,12 @@ fn nav_item(ui: &mut egui::Ui, label: &str, page: Page, cur: &mut Page) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogTab {
+    Program,
+    Task,
+}
+
 fn kind_key(kind: engine::Kind) -> &'static str {
     match kind {
         engine::Kind::Http => "http",
@@ -281,8 +291,19 @@ fn kind_key(kind: engine::Kind) -> &'static str {
     }
 }
 
+fn boot_line(t0: Instant, msg: impl AsRef<str>) -> String {
+    format!("[{:>6.2}s] {}", t0.elapsed().as_secs_f32(), msg.as_ref())
+}
+
+fn tcp_open(port: u16) -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    TcpStream::connect_timeout(&addr, Duration::from_millis(120)).is_ok()
+}
+
 impl App {
     fn new() -> App {
+        let boot_at = Instant::now();
         let root = engine::find_root();
         // 首次运行：补齐目录与 aria2 配置，用户不用手动复制示例文件
         let layout = setup::ensure_layout(&root);
@@ -297,6 +318,99 @@ impl App {
         let cloud = av::load_cloud(&root);
         let created_conf = layout.created_conf;
         let root_for_policy = root.clone();
+        let policy = if ENHANCED {
+            policy::Policy::load(&root_for_policy)
+        } else {
+            policy::Policy::default()
+        };
+
+        // 启动日志：从版本、路径到依赖与服务状态，排障时先看这一段
+        let mut app_log: Vec<String> = Vec::new();
+        app_log.push(boot_line(boot_at, format!("DLKit {} 启动", env!("CARGO_PKG_VERSION"))));
+        app_log.push(boot_line(
+            boot_at,
+            format!("程序目录：{}", root.display()),
+        ));
+        app_log.push(boot_line(
+            boot_at,
+            format!("配置文件：{}", config_path().display()),
+        ));
+        app_log.push(boot_line(
+            boot_at,
+            format!("下载目录：{}", cfg.dir.display()),
+        ));
+        let limit_txt = if cfg.limit <= 0.0 {
+            "不限".to_string()
+        } else {
+            format!("{} MB/s", cfg.limit)
+        };
+        app_log.push(boot_line(
+            boot_at,
+            format!(
+                "下载参数：引擎 {}，并发 {}，限速 {}",
+                cfg.engine, cfg.conn, limit_txt
+            ),
+        ));
+        if created_conf {
+            app_log.push(boot_line(boot_at, "首次运行：已生成 config/aria2.conf"));
+        }
+        if crash_log.is_some() {
+            app_log.push(boot_line(boot_at, "检测到上次异常退出的日志"));
+        }
+        app_log.push(boot_line(boot_at, format!("策略：{}", policy.describe())));
+        for dep in deps::DEPS {
+            let ok = deps::installed(&root, dep);
+            app_log.push(boot_line(
+                boot_at,
+                format!(
+                    "依赖 {}：{}",
+                    dep.key,
+                    if ok {
+                        "已就位"
+                    } else {
+                        "缺失（可在设置里一键安装）"
+                    }
+                ),
+            ));
+        }
+        app_log.push(boot_line(
+            boot_at,
+            format!(
+                "aria2 服务：{}",
+                if tcp_open(6800) {
+                    "127.0.0.1:6800 在线"
+                } else {
+                    "未运行（BT / 网盘需要时会尝试启动）"
+                }
+            ),
+        ));
+        let bili = match acc.bili_mode.as_str() {
+            accounts::MODE_BROWSER => format!("从 {} 读取 Cookie", acc.bili_browser),
+            accounts::MODE_MANUAL => "手动粘贴的 Cookie".to_string(),
+            _ => "未配置".to_string(),
+        };
+        app_log.push(boot_line(boot_at, format!("B站账号：{}", bili)));
+        app_log.push(boot_line(
+            boot_at,
+            format!(
+                "OpenList：{}",
+                if acc.ol_base.trim().is_empty() {
+                    "未配置"
+                } else {
+                    acc.ol_base.as_str()
+                }
+            ),
+        ));
+        app_log.push(boot_line(
+            boot_at,
+            format!("链接跟踪：{} 个条目", watch.snapshot().len()),
+        ));
+        app_log.push(boot_line(boot_at, "已开始检查更新"));
+        app_log.push(boot_line(
+            boot_at,
+            format!("初始化完成（{} ms）", boot_at.elapsed().as_millis()),
+        ));
+
         let app = App {
             url: String::new(),
             ol_path: String::new(),
@@ -331,13 +445,12 @@ impl App {
             diag_rx: None,
             diag_checks: None,
             crash_log,
+            boot_at,
+            app_log,
+            log_tab: LogTab::Program,
             av_scanned: std::collections::HashSet::new(),
             cloud,
-            policy: if ENHANCED {
-                policy::Policy::load(&root_for_policy)
-            } else {
-                policy::Policy::default()
-            },
+            policy,
             sched_applied: None,
             sched_at: Instant::now() - Duration::from_secs(60),
             pending: Vec::new(),
@@ -443,9 +556,17 @@ impl App {
         ol: Option<String>,
         extra: BTreeMap<String, String>,
     ) {
+        let conn = self.task_conn(url, kind);
+        self.log_program(format!(
+            "添加任务：{}（{}，{} 路，目录 {}）",
+            url,
+            kind_key(kind),
+            conn,
+            dir.display()
+        ));
         let args = engine::SpawnArgs {
             dir,
-            conn: self.task_conn(url, kind),
+            conn,
             engine: self.cfg.engine.clone(),
             ol_path: ol,
             extra,
@@ -464,6 +585,16 @@ impl App {
                     t.message = format!("排队中（最多同时 {} 个任务）", limit);
                 }
                 let prio = self.policy.priority_for(url, kind_key(kind));
+                self.log_program(format!(
+                    "任务排队：{}（同时最多 {} 个，优先级 {}）",
+                    url,
+                    limit,
+                    match prio {
+                        2 => "高",
+                        0 => "低",
+                        _ => "普通",
+                    }
+                ));
                 self.pending.push((shared, args, prio));
                 return;
             }
@@ -2097,8 +2228,18 @@ impl App {
     }
 
     fn notify(&mut self, msg: impl Into<String>) {
-        self.toast = msg.into();
+        let m = msg.into();
+        self.log_program(&m);
+        self.toast = m;
         self.toast_at = Instant::now();
+    }
+
+    /// 写一条程序日志（带启动以来的时间戳）
+    fn log_program(&mut self, msg: impl AsRef<str>) {
+        self.app_log.push(boot_line(self.boot_at, msg));
+        if self.app_log.len() > 500 {
+            self.app_log.drain(0..200);
+        }
     }
 
     /// 复制链接后自动填入输入框。只在新复制、且输入框没有被手动改过时覆盖。
@@ -2693,17 +2834,22 @@ impl eframe::App for App {
                 }
             });
 
-        let log_lines: Vec<String> = self
-            .tasks
-            .get(self.selected)
-            .and_then(snapshot)
-            .map(|s| s.log)
-            .unwrap_or_default();
+        let program_lines = self.app_log.clone();
+        let task_snap = self.tasks.get(self.selected).and_then(snapshot);
+        let task_log: Vec<String> = task_snap.as_ref().map(|s| s.log.clone()).unwrap_or_default();
+        let task_name = task_snap.map(|s| s.name).unwrap_or_default();
+        let mut want_tab: Option<LogTab> = None;
+        let mut copy_logs = false;
+        let lines: &[String] = if self.log_tab == LogTab::Program {
+            &program_lines
+        } else {
+            &task_log
+        };
 
         // ---------- 日志 ----------
         egui::Panel::bottom("log")
             .resizable(true)
-            .default_size(140.0)
+            .default_size(150.0)
             .frame(
                 egui::Frame::NONE
                     .fill(PANEL)
@@ -2711,19 +2857,63 @@ impl eframe::App for App {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("日志").size(11.5).color(SECONDARY));
+                    if ui
+                        .selectable_label(
+                            self.log_tab == LogTab::Program,
+                            RichText::new("程序日志").size(11.5),
+                        )
+                        .clicked()
+                    {
+                        want_tab = Some(LogTab::Program);
+                    }
+                    if ui
+                        .selectable_label(
+                            self.log_tab == LogTab::Task,
+                            RichText::new("任务日志").size(11.5),
+                        )
+                        .clicked()
+                    {
+                        want_tab = Some(LogTab::Task);
+                    }
                     ui.label(
-                        RichText::new(format!("{} 条", log_lines.len()))
+                        RichText::new(format!("{} 条", lines.len()))
                             .size(11.0)
                             .color(MUTED),
+                    );
+                    if self.log_tab == LogTab::Task && !task_name.is_empty() {
+                        ui.label(
+                            RichText::new(format!("· {}", task_name))
+                                .size(10.5)
+                                .color(MUTED),
+                        );
+                    }
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.small_button("复制").clicked() {
+                                copy_logs = true;
+                            }
+                        },
                     );
                 });
                 ui.add_space(2.0);
                 egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
+                    // 程序日志从启动开始按顺序看；任务日志跟随最新进度
+                    .stick_to_bottom(self.log_tab == LogTab::Task)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for line in log_lines.iter().rev().take(200).rev() {
+                        if lines.is_empty() {
+                            ui.label(
+                                RichText::new(if self.log_tab == LogTab::Program {
+                                    "暂无程序日志"
+                                } else {
+                                    "选中一个任务后，这里显示它的下载日志"
+                                })
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                        }
+                        for line in lines.iter().rev().take(300).rev() {
                             ui.label(
                                 RichText::new(line)
                                     .size(11.5)
@@ -2733,6 +2923,14 @@ impl eframe::App for App {
                         }
                     });
             });
+
+        if let Some(t) = want_tab {
+            self.log_tab = t;
+        }
+        if copy_logs {
+            clipboard_set(&lines.join("\n"));
+            self.notify("日志已复制");
+        }
 
         }
 

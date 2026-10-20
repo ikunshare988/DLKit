@@ -949,7 +949,8 @@ fn short_hash(h: &str) -> &str {
 
 fn log_line(task: &Shared, line: String) {
     if let Ok(mut t) = task.lock() {
-        t.log.push(line);
+        let secs = t.started.elapsed().as_secs_f32();
+        t.log.push(format!("[{:>6.2}s] {}", secs, line));
         if t.log.len() > 500 {
             t.log.drain(0..100);
         }
@@ -2604,6 +2605,25 @@ pub fn run_pool(
         .ok()
         .and_then(|s| serde_json::from_str::<State>(&s).ok())
         .unwrap_or_default();
+    log_line(
+        &task,
+        format!(
+            "目标：{}（{} 路 + {} 备用，单任务限速 {}）",
+            url,
+            conn,
+            extra,
+            match &rate {
+                Some(_) => "已启用",
+                None => "跟随全局",
+            }
+        ),
+    );
+    if !prev.done.is_empty() {
+        log_line(
+            &task,
+            format!("发现续传记录：已完成 {} 块，跳过已下载部分", prev.done.len()),
+        );
+    }
 
     // 首段请求：同时完成「探测大小」和「下载第一段」，不给握手多付一次时间。
     // 只用 1MB：太大会让首条连接独占大块，后面的 worker 分不到活，反而拖慢峰值。
@@ -2641,6 +2661,17 @@ pub fn run_pool(
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0)
     };
+    log_line(
+        &task,
+        format!(
+            "探测：HTTP {} / {}，{}，大小 {}；最终地址 {}",
+            code,
+            http_ver,
+            if ranges { "支持分片" } else { "不支持分片" },
+            human_size(size),
+            final_url
+        ),
+    );
     if ranges && size == 0 {
         return Err(EngErr::Soft("无法从 Content-Range 获取文件大小".into()));
     }
@@ -3129,6 +3160,23 @@ pub fn run_pool(
     }
     let _ = fs::remove_file(&state_path);
     set_progress(&task, size, size, 0.0);
+    let elapsed = task
+        .lock()
+        .map(|t| t.started.elapsed().as_secs_f32())
+        .unwrap_or(0.0);
+    log_line(
+        &task,
+        format!(
+            "完成：{}，用时 {:.1}s，平均 {:.2} MB/s",
+            human_size(size),
+            elapsed,
+            if elapsed > 0.0 {
+                size as f64 / 1048576.0 / elapsed as f64
+            } else {
+                0.0
+            }
+        ),
+    );
     drop(file);
     drop(ctx);
     if final_name != name0 {
