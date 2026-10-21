@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "DLKit 浏览器接管",
+  "version": "1.0.0",
+  "description": "右键用 DLKit 下载，或把浏览器下载交给 DLKit。",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0YDt1RZYHDTBI//APVAj0AHn1RRoZECQW/JgOZeKvseMVBpA6lzW7xMrHxYXOv+Z5s2PEMGtJVEsp2F6K/Ys8xqdQAg2pYd8opSksdeDrgA2y5c9CZpkyEYBGX5m6b9a68WG+o23EDXyPvKsOzCwTIa3zfHjgE/FDJFtt8aVelMPoAxx01m+HBwAJjU4novd2vQb/5AXvbwv6zxJGvMRu9foTBgHBv3KhP0gO0AGTi4aQqQzF+yDLgAzJe7DdL+2R9lK8IgqoFov+WBG3VhS3yjIM/AX8H9Bomz+LyuU6RoAtBHWcgxFVa9gBxD4OsA1nindVa1lg6lqhKeLGQRyGQIDAQAB",
+  "permissions": ["contextMenus", "downloads", "nativeMessaging", "storage"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "DLKit 浏览器接管"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  }
+}

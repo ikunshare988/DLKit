@@ -35,7 +35,7 @@ cosign verify-blob --bundle DLKit.exe.bundle `
 
 ## Setup
 
-The simplest path: drop `DLKit.exe` into any writable folder (Desktop, `D:\DLKit`) and double-click it. The first launch creates `config/`, `logs/` and `aria2.conf` with a random `rpc-secret`; downloads go to your system Downloads folder by default.
+The simplest path: drop `DLKit.exe` into any writable folder (Desktop, `D:\DLKit`) and double-click it. The first launch creates `config/`, `logs/` and `aria2.conf` with a random `rpc-secret`, sends downloads to your system Downloads folder by default, and shows a skippable quick-start guide.
 
 Direct downloads only need the system `curl`. The command-line tools used by torrents and video sites can be installed from Settings → Dependencies, or with the one-click banner shown on first use:
 
@@ -138,6 +138,15 @@ A rule means: when a URL starts with `from`, also try the same URL with that pre
 - Video sites (Bilibili, YouTube, Douyin and others): handled by yt-dlp, merged with ffmpeg
 - Cloud drives: direct links via OpenList (you host OpenList yourself)
 
+### Browser takeover (both editions)
+
+- Right-click a link or image → "Download with DLKit"; right-click a page → "Scan this page with DLKit"
+- Downloads started by the browser are cancelled and handed to DLKit; interception can be turned off in the extension options
+- Settings → Browser takeover → "Enable": writes the registry entry and extension files, then opens the browser's extension page and the extension folder; browsers still require one confirmation (developer mode → load unpacked → `%LOCALAPPDATA%\DLKit\extension`)
+- Enabled by default; turning it off keeps normal downloads working
+- The local bridge listens on `127.0.0.1` only, validates a random token, and native messaging accepts only the fixed extension ID
+- No cookies are read or synced; only the URL and referrer are passed
+
 ### Accounts
 
 - The Accounts page manages Bilibili login: read cookies from Edge / Chrome / Firefox (passed to yt-dlp), or paste them manually
@@ -200,6 +209,9 @@ Copy `config/policy.example.json` to `config/policy.json`; reload it from Settin
 
 - Network throughput and disk write speed are shown separately
 - The log panel has two tabs, Program and Task, both timestamped
+- Failures are classified into error codes with a suggested next step: 401/403 can retry with a referer or open the page to sign in, timeouts can retry on a single connection, disk/permission problems lead straight to changing the folder
+- Retries reuse existing chunks instead of starting over; every failed task has "Copy report" with the error code, task parameters and recent logs (query strings are redacted)
+- Common codes: `HTTP_401/403/404/429/5XX`, `TIMEOUT`, `DNS`, `TLS`, `DISK_FULL`, `DISK_DENIED`, `ARIA2_OFFLINE`, `DEP_MISSING`, `RANGE`, `MIRROR`
 - Program logs cover startup, paths, parameters, dependencies, aria2 status, accounts, policy and update checks through initialization, and can be copied in one click
 - Task logs record the probe result (HTTP status, range support, size, final URL), resume state, pool parameters, retries and source switches, plus final duration and average speed
 - If a domain resolves to 127.0.0.1 via hosts, the app says so and explains it may be a block or an accelerator that is not active
@@ -225,6 +237,7 @@ One codebase, two builds:
 | Faster scanning, GitHub / npm / PyPI APIs, cache | yes | yes |
 | Throughput-weighted source selection, mirror verification | yes | yes |
 | Basic settings (folder / connections / limit / engine) | yes | yes |
+| Browser takeover (context menu / intercept downloads) | yes | yes |
 | Torrents / video sites / cloud drives, one-click dependencies | — | yes |
 | Link tracking | — | yes |
 | Accounts (Bilibili cookies / OpenList) | — | yes |

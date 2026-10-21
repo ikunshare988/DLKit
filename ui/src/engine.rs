@@ -93,6 +93,8 @@ pub struct Task {
     /// 官方清单给出的 SHA256（可选），下载完成后自动核对
     pub sha256: Option<String>,
     pub output: Option<PathBuf>,
+    /// 诊所重试次数
+    pub attempts: u32,
     /// 下载完成后的安全检查结果（增强版）
     #[cfg(feature = "enhanced")]
     pub av: Option<crate::av::Report>,
@@ -160,6 +162,7 @@ impl Task {
             spawn: None,
             sha256: None,
             output: None,
+            attempts: 0,
             #[cfg(feature = "enhanced")]
             av: None,
             #[cfg(feature = "enhanced")]
@@ -4702,6 +4705,43 @@ pub fn pause_task(task: &Shared) {
             t.message = "正在暂停…".into();
         }
     }
+}
+
+/// 诊所重试：沿用首次启动参数，可覆盖并发与请求头；已完成的分块会通过状态文件跳过。
+/// 返回 false 表示这个任务没有首次启动参数（例如资源预算排队中还没真正开始）。
+pub fn retry_task(
+    root: PathBuf,
+    task: Shared,
+    conn: Option<usize>,
+    extra: Option<BTreeMap<String, String>>,
+) -> bool {
+    let args = match task.lock() {
+        Ok(t) => t.spawn.clone(),
+        Err(_) => None,
+    };
+    let Some(args) = args else {
+        return false;
+    };
+    let conn = conn.unwrap_or(args.conn).clamp(1, 128);
+    let extra = extra.unwrap_or(args.extra);
+    if let Ok(mut t) = task.lock() {
+        t.pause.store(false, Ordering::SeqCst);
+        t.cancel.store(false, Ordering::SeqCst);
+        t.status = Status::Queued;
+        t.message = "重试中…".into();
+        t.speed = 0.0;
+        t.net_speed = 0.0;
+        t.disk_speed = 0.0;
+        t.attempts = t.attempts.saturating_add(1);
+        #[cfg(feature = "enhanced")]
+        {
+            t.av = None;
+        }
+        let n = t.attempts;
+        t.log.push(format!("第 {} 次重试", n));
+    }
+    spawn_ext(root, task, args.dir, conn, args.engine, args.ol_path, extra);
+    true
 }
 
 /// 继续：复用首次启动的参数重新进入下载线程，已完成的分块会跳过

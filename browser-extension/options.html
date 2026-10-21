@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>DLKit 浏览器接管</title>
+    <style>
+      body {
+        font: 14px/1.6 "Microsoft YaHei", system-ui, sans-serif;
+        color: #27445a;
+        background: #f8fcfe;
+        margin: 0;
+        padding: 18px 20px;
+      }
+      h1 {
+        font-size: 16px;
+        margin: 0 0 12px;
+        color: #4b9ac4;
+      }
+      label {
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+        margin: 10px 0;
+      }
+      .hint {
+        color: #7d99a9;
+        font-size: 12px;
+        margin: 6px 0 0;
+      }
+      .box {
+        background: #fff;
+        border: 1px solid #d9e9f1;
+        border-radius: 12px;
+        padding: 12px 14px;
+      }
+      code {
+        background: #eaf5fa;
+        border-radius: 4px;
+        padding: 1px 4px;
+        font-size: 12px;
+      }
+      #status {
+        margin-top: 10px;
+        font-size: 12px;
+        color: #d9536f;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>DLKit 浏览器接管</h1>
+    <div class="box">
+      <label>
+        <input type="checkbox" id="intercept" />
+        <span>拦截浏览器发起的下载，交给 DLKit</span>
+      </label>
+      <p class="hint">
+        关闭后只保留右键菜单；浏览器下载不再被接管。修改会自动保存。
+      </p>
+      <p class="hint">
+        扩展 ID：<code id="extid"></code>
+      </p>
+      <div id="status"></div>
+    </div>
+    <script src="options.js"></script>
+  </body>
+</html>

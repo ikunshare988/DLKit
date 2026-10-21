@@ -43,3 +43,6 @@
 *.swp
 .DS_Store
 Thumbs.db
+
+# 扩展签名私钥等本地材料
+/.local/

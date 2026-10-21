@@ -13,6 +13,8 @@ mod av;
 mod deps;
 #[cfg(feature = "enhanced")]
 mod diag;
+mod bridge;
+mod clinic;
 mod engine;
 #[cfg(feature = "enhanced")]
 mod mcp;
@@ -89,6 +91,10 @@ struct Config {
     engine: String,
     /// 全局限速（MB/s），0 表示不限
     limit: f64,
+    /// 浏览器接管（右键下载 / 接管浏览器下载）
+    browser: bool,
+    /// 是否已经看过新手引导
+    seen_guide: bool,
     /// 增强版：下载完成后自动做安全检查
     #[cfg(feature = "enhanced")]
     av_auto: bool,
@@ -113,6 +119,8 @@ impl Default for Config {
             conn: 32,
             engine: "auto".into(),
             limit: 0.0,
+            browser: true,
+            seen_guide: false,
             #[cfg(feature = "enhanced")]
             av_auto: true,
             #[cfg(feature = "enhanced")]
@@ -136,6 +144,8 @@ fn load_config() -> Config {
         conn: Option<usize>,
         engine: Option<String>,
         limit: Option<f64>,
+        browser: Option<bool>,
+        seen_guide: Option<bool>,
         #[cfg(feature = "enhanced")]
         av_auto: Option<bool>,
         #[cfg(feature = "enhanced")]
@@ -159,6 +169,12 @@ fn load_config() -> Config {
             }
             if let Some(l) = raw.limit {
                 cfg.limit = l.clamp(0.0, 100.0);
+            }
+            if let Some(v) = raw.browser {
+                cfg.browser = v;
+            }
+            if let Some(v) = raw.seen_guide {
+                cfg.seen_guide = v;
             }
             #[cfg(feature = "enhanced")]
             {
@@ -186,7 +202,9 @@ fn save_config(cfg: &Config) {
         "dir": cfg.dir.to_string_lossy(),
         "conn": cfg.conn,
         "engine": cfg.engine,
-        "limit": cfg.limit
+        "limit": cfg.limit,
+        "browser": cfg.browser,
+        "seen_guide": cfg.seen_guide
 
 
 
@@ -215,12 +233,15 @@ enum Page {
 /// 任务卡片里点了动作后要做的事：先记下来，等遍历结束再改 self，
 /// 避免和 `self.tasks.iter()` 的借用冲突。
 enum CardAction {
-    #[cfg(feature = "enhanced")]
-    Services,
-    #[cfg(feature = "enhanced")]
-    Accounts,
+    /// 任务、重试方式
+    Retry(Shared, clinic::Retry),
+    /// 用默认浏览器打开链接
+    OpenUrl(String),
     Settings,
-    CopyError(String),
+    /// 诊所报告正文
+    CopyReport(String),
+    #[cfg(feature = "enhanced")]
+    StartService,
     #[cfg(feature = "enhanced")]
     Quarantine(PathBuf),
     #[cfg(feature = "enhanced")]
@@ -297,6 +318,16 @@ struct App {
     boot_at: Instant,
     app_log: Vec<String>,
     log_tab: LogTab,
+    /// 浏览器接管：本地桥的消息
+    bridge_rx: std::sync::mpsc::Receiver<bridge::Msg>,
+    bridge: Option<bridge::Bridge>,
+    /// 设置页显示的注册状态（避免每帧都查注册表）
+    bridge_status: String,
+    /// 新手引导
+    show_guide: bool,
+    guide_page: usize,
+    /// 一键启用后的两步说明
+    show_browser_help: bool,
     /// 已经安排过安全检查的文件（按路径去重）
     #[cfg(feature = "enhanced")]
     av_scanned: std::collections::HashSet<PathBuf>,
@@ -394,6 +425,19 @@ impl App {
         let created_conf = layout.created_conf;
         #[cfg(feature = "enhanced")]
         let policy = policy::Policy::load(&root);
+
+        // 浏览器接管：本地桥 + native messaging 注册（默认开启）
+        let (bridge_tx, bridge_rx) = std::sync::mpsc::channel();
+        let bridge = bridge::start(bridge_tx);
+        let bridge_port = bridge.as_ref().map(|b| b.port);
+        let bridge_msg = if cfg.browser {
+            let exe = std::env::current_exe().ok();
+            bridge::apply(true, exe.as_deref())
+        } else {
+            "已关闭".to_string()
+        };
+        // 注册状态等真正打开设置页再查，避免启动时多起几个 reg.exe
+        let bridge_status = String::new();
 
         // 启动日志：从版本、路径到依赖与服务状态，排障时先看这一段
         let mut app_log: Vec<String> = Vec::new();
@@ -494,9 +538,21 @@ impl App {
         }
         app_log.push(boot_line(
             boot_at,
+            match bridge_port {
+                Some(p) => format!("浏览器接管：127.0.0.1:{}（{}）", p, bridge_msg),
+                None => format!("浏览器接管：本地桥未启动（{}）", bridge_msg),
+            },
+        ));
+        app_log.push(boot_line(
+            boot_at,
+            format!("扩展目录：{}", bridge::extension_dir().display()),
+        ));
+        app_log.push(boot_line(
+            boot_at,
             format!("初始化完成（{} ms）", boot_at.elapsed().as_millis()),
         ));
 
+        let show_guide = !cfg.seen_guide;
         let app = App {
             url: String::new(),
             #[cfg(feature = "enhanced")]
@@ -552,6 +608,12 @@ impl App {
             boot_at,
             app_log,
             log_tab: LogTab::Program,
+            bridge_rx,
+            bridge,
+            bridge_status,
+            show_guide,
+            guide_page: 0,
+            show_browser_help: false,
             #[cfg(feature = "enhanced")]
             av_scanned: std::collections::HashSet::new(),
             #[cfg(feature = "enhanced")]
@@ -1352,6 +1414,14 @@ impl App {
                             ui.end_row();
                         });
                 });
+
+                ui.add_space(12.0);
+                self.draw_browser_card(ui);
+                ui.add_space(8.0);
+                if ui.button("查看新手引导").clicked() {
+                    self.show_guide = true;
+                    self.guide_page = 0;
+                }
 
                 #[cfg(feature = "enhanced")]
                 {
@@ -2447,6 +2517,383 @@ impl App {
         }
     }
 
+    /// 浏览器扩展通过本地桥送来的任务
+    fn poll_bridge(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.bridge_rx.try_recv() {
+            match msg {
+                bridge::Msg::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                bridge::Msg::Scan(url) => {
+                    self.url = url;
+                    self.page = Page::Download;
+                    self.start_scan();
+                }
+                bridge::Msg::Download(items) => {
+                    let mut added = 0;
+                    for it in items {
+                        let dup = self
+                            .tasks
+                            .iter()
+                            .any(|t| t.lock().map(|x| x.url == it.url).unwrap_or(false));
+                        if dup {
+                            continue;
+                        }
+                        let (kind, why) = engine::classify(&it.url);
+                        if kind != engine::Kind::Http {
+                            self.log_program(format!(
+                                "浏览器接管跳过：{}（{}）",
+                                it.url, why
+                            ));
+                            continue;
+                        }
+                        let name = if it.filename.trim().is_empty() {
+                            "来自浏览器".to_string()
+                        } else {
+                            it.filename.clone()
+                        };
+                        let task = Task::new(it.url.clone(), kind, name);
+                        let mut extra = BTreeMap::new();
+                        if !it.referer.trim().is_empty() {
+                            extra.insert("Referer".into(), it.referer.clone());
+                        }
+                        let shared: Shared = Arc::new(Mutex::new(task));
+                        self.submit(
+                            shared.clone(),
+                            &it.url,
+                            kind,
+                            self.task_dir(),
+                            None,
+                            extra,
+                        );
+                        self.tasks.push(shared);
+                        added += 1;
+                    }
+                    if added > 0 {
+                        self.selected = self.tasks.len().saturating_sub(added);
+                        self.page = Page::Download;
+                        self.notify(format!("已从浏览器接收 {} 个任务", added));
+                    }
+                }
+            }
+        }
+    }
+
+    /// 安装/修复浏览器接管（清单 + 注册表 + 扩展文件）
+    fn install_bridge(&mut self) {
+        let exe = std::env::current_exe().ok();
+        let msg = bridge::apply(true, exe.as_deref());
+        self.bridge_status = bridge::host_status();
+        self.log_program(format!("浏览器接管：{}", msg));
+        self.notify(msg);
+    }
+
+    /// 一键启用：写好注册表和扩展文件，直接打开浏览器扩展页 + 扩展目录
+    fn enable_browser(&mut self) {
+        self.install_bridge();
+        let browsers = bridge::installed_browsers();
+        let mut opened = None;
+        if let Some((name, _)) = browsers.first() {
+            if bridge::open_extensions_page(name).is_ok() {
+                opened = Some(*name);
+            }
+        }
+        if let Err(e) = bridge::open_extension_dir() {
+            self.notify(e);
+        }
+        self.show_browser_help = true;
+        match opened {
+            Some(n) => self.log_program(format!("已打开 {} 扩展页和扩展目录", n)),
+            None => self.log_program("没有可自动打开的浏览器，请手动打开扩展页"),
+        }
+    }
+
+    /// 一键启用后的两步说明
+    fn draw_browser_help(&mut self, ctx: &egui::Context) {
+        if !self.show_browser_help {
+            return;
+        }
+        let browsers = bridge::installed_browsers();
+        let dir = bridge::extension_dir().display().to_string();
+        let mut close = false;
+        let mut open_dir = false;
+        let mut open_name: Option<&'static str> = None;
+        egui::Window::new("完成浏览器接管")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(560.0)
+            .max_width(600.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("还差两步，浏览器就能接管下载")
+                        .size(16.0)
+                        .strong()
+                        .color(PRIMARY),
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new("1. 在刚打开的扩展页，打开右上角的「开发者模式」").size(13.0));
+                ui.label(RichText::new("2. 点「加载已解压的扩展」，选择这个目录：").size(13.0));
+                ui.label(
+                    RichText::new(&dir)
+                        .monospace()
+                        .size(12.0)
+                        .color(PRIMARY),
+                );
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("打开扩展目录").clicked() {
+                        open_dir = true;
+                    }
+                    if ui.button("复制目录").clicked() {
+                        clipboard_set(&dir);
+                    }
+                    for (name, _) in &browsers {
+                        if ui.button(format!("打开 {} 扩展页", name)).clicked() {
+                            open_name = Some(*name);
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("也可以手动打开 chrome://extensions 或 edge://extensions")
+                        .size(10.5)
+                        .color(MUTED),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let btn = egui::Button::new(
+                        RichText::new("我已完成").size(12.5).color(Color32::WHITE),
+                    )
+                    .fill(PRIMARY)
+                    .corner_radius(CornerRadius::same(12));
+                    if ui.add(btn).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if open_dir {
+            if let Err(e) = bridge::open_extension_dir() {
+                self.notify(e);
+            }
+        }
+        if let Some(n) = open_name {
+            if let Err(e) = bridge::open_extensions_page(n) {
+                self.notify(e);
+            }
+        }
+        if close {
+            self.show_browser_help = false;
+        }
+    }
+
+    /// 设置页：浏览器接管
+    fn draw_browser_card(&mut self, ui: &mut egui::Ui) {
+        if self.bridge_status.is_empty() {
+            self.bridge_status = bridge::host_status();
+        }
+        card_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("浏览器接管").strong().size(15.0).color(TEXT));
+                let ok = self.bridge_status.starts_with("已注册");
+                pill(
+                    ui,
+                    &self.bridge_status,
+                    if ok { SUCCESS } else { MUTED },
+                    if ok { SUCCESS_BG } else { PANEL },
+                );
+            });
+            ui.add_space(3.0);
+            ui.label(
+                RichText::new("右键网页链接 / 图片用 DLKit 下载，浏览器下载也会自动接管")
+                    .size(11.0)
+                    .color(MUTED),
+            );
+            ui.add_space(6.0);
+            let mut on = self.cfg.browser;
+            if ui
+                .checkbox(&mut on, "启用浏览器接管（默认开启）")
+                .changed()
+            {
+                self.cfg.browser = on;
+                save_config(&self.cfg);
+                if on {
+                    self.enable_browser();
+                } else {
+                    bridge::uninstall_native_host();
+                    self.bridge_status = bridge::host_status();
+                    self.notify("已关闭浏览器接管");
+                }
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let btn = egui::Button::new(
+                    RichText::new("一键启用").size(12.5).color(Color32::WHITE),
+                )
+                .fill(PRIMARY)
+                .corner_radius(CornerRadius::same(12));
+                if ui
+                    .add(btn)
+                    .on_hover_text("注册接管并打开浏览器扩展页和扩展目录")
+                    .clicked()
+                {
+                    self.enable_browser();
+                }
+                if ui.button("重新注册").clicked() {
+                    self.install_bridge();
+                }
+                if ui.button("打开扩展目录").clicked() {
+                    if let Err(e) = bridge::open_extension_dir() {
+                        self.notify(e);
+                    }
+                }
+                if ui.button("复制扩展 ID").clicked() {
+                    clipboard_set(bridge::EXTENSION_ID);
+                    self.notify("扩展 ID 已复制");
+                }
+            });
+            let names: Vec<&str> = bridge::installed_browsers()
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
+            let detected = if names.is_empty() {
+                "没有检测到 Chrome / Edge".to_string()
+            } else {
+                format!("已检测到 {}", names.join(" / "))
+            };
+            ui.label(
+                RichText::new(format!(
+                    "{}；一键启用会打开扩展页和目录。浏览器要求首次在扩展页确认加载一次（开发者模式 → 加载已解压的扩展）",
+                    detected
+                ))
+                .size(10.5)
+                .color(MUTED),
+            );
+        });
+    }
+
+    /// 新手引导（可跳过，两版共用，增强版多一页）
+    fn guide_pages(&self) -> Vec<(&'static str, &'static str)> {
+        let mut pages = vec![
+            (
+                "欢迎使用 DLKit",
+                "单文件下载器：不用浏览器内核，也不用安装 Python 或运行库。\n\
+                 核心只有下载、解析和设置，打开就能用。",
+            ),
+            (
+                "下载与解析",
+                "粘贴直链后点 ＋ 开始下载；下载页点「解析页面」，程序会列出页面里的文件，并自动选中本机版本。\n\
+                 失败后重试会接着已经下载的部分，不会重下。",
+            ),
+            (
+                "设置与下载诊所",
+                "并发、限速、下载目录都在「设置」里。\n\
+                 失败时会给出错误码和建议：补来源页、单连接重试、换目录；点「复制报告」可以把问题发出来。",
+            ),
+            (
+                "浏览器接管",
+                "右键网页链接 / 图片 →「用 DLKit 下载」，浏览器发起的下载也会自动接管。\n\
+                 点下面的「现在启用」，程序会打开扩展页和扩展目录，按提示加载一次即可。",
+            ),
+        ];
+        if ENHANCED {
+            pages.push((
+                "增强版专属",
+                "链接跟踪、账号、按站点策略、下载后安全检查、托盘常驻、自动更新和 MCP Server。\n\
+                 这些在左侧导航和设置里，可以按需打开。",
+            ));
+        }
+        pages
+    }
+
+    fn draw_guide(&mut self, ctx: &egui::Context) {
+        if !self.show_guide {
+            return;
+        }
+        let pages = self.guide_pages();
+        let last = pages.len().saturating_sub(1);
+        let mut finish = false;
+        let mut enable_now = false;
+        let mut go = 0i32;
+        egui::Window::new("新手引导")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(520.0)
+            .max_width(560.0)
+            .show(ctx, |ui| {
+                let idx = self.guide_page.min(last);
+                let (title, body) = pages[idx];
+                ui.label(RichText::new(title).size(18.0).strong().color(PRIMARY));
+                ui.add_space(8.0);
+                for line in body.lines() {
+                    ui.label(RichText::new(line).size(13.0).color(TEXT));
+                    ui.add_space(2.0);
+                }
+                if idx == 3 {
+                    ui.add_space(8.0);
+                    let btn = egui::Button::new(
+                        RichText::new("现在启用浏览器接管")
+                            .size(12.5)
+                            .color(Color32::WHITE),
+                    )
+                    .fill(ACCENT)
+                    .corner_radius(CornerRadius::same(12));
+                    if ui.add(btn).clicked() {
+                        enable_now = true;
+                    }
+                }
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if ui.button("跳过").clicked() {
+                        finish = true;
+                    }
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let next = if idx == last { "开始使用" } else { "下一步" };
+                            let btn = egui::Button::new(
+                                RichText::new(next).size(12.5).color(Color32::WHITE),
+                            )
+                            .fill(PRIMARY)
+                            .corner_radius(CornerRadius::same(12));
+                            if ui.add(btn).clicked() {
+                                if idx == last {
+                                    finish = true;
+                                } else {
+                                    go = 1;
+                                }
+                            }
+                            if idx > 0 && ui.button("上一步").clicked() {
+                                go = -1;
+                            }
+                        },
+                    );
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    for i in 0..pages.len() {
+                        let c = if i == idx { PRIMARY } else { tint(BORDER, 140) };
+                        ui.label(RichText::new("●").size(9.0).color(c));
+                    }
+                });
+            });
+        if go > 0 {
+            self.guide_page = (self.guide_page + 1).min(last);
+        } else if go < 0 {
+            self.guide_page = self.guide_page.saturating_sub(1);
+        }
+        if finish || enable_now {
+            self.show_guide = false;
+            self.cfg.seen_guide = true;
+            save_config(&self.cfg);
+        }
+        if enable_now {
+            self.enable_browser();
+        }
+    }
+
     /// 把拖进窗口的 .torrent 或链接直接加入/填入
     fn take_dropped(&mut self, ui: &egui::Ui) {
         let dropped: Vec<String> = ui.ctx().input(|i| {
@@ -2684,7 +3131,12 @@ fn fmt_eta(done: u64, total: u64, mbps: f64) -> String {
 
 struct Snap {
     name: String,
+    url: String,
     kind: engine::Kind,
+    conn: usize,
+    attempts: u32,
+    has_referer: bool,
+    elapsed: f32,
     status: Status,
     message: String,
     done: u64,
@@ -2698,11 +3150,49 @@ struct Snap {
     av: Option<av::Report>,
 }
 
+/// 诊所「补来源页重试」：已有 Referer 就沿用，没有就用链接所在站点首页。
+fn referer_extra(task: &Shared) -> Option<BTreeMap<String, String>> {
+    let t = task.lock().ok()?;
+    let mut h = t
+        .spawn
+        .as_ref()
+        .map(|s| s.extra.clone())
+        .unwrap_or_default();
+    if !h.contains_key("Referer") {
+        if let Some(origin) = url_origin(&t.url) {
+            h.insert("Referer".into(), origin);
+        }
+    }
+    Some(h)
+}
+
+fn url_origin(url: &str) -> Option<String> {
+    let i = url.find("://")?;
+    let rest = &url[i + 3..];
+    let end = rest
+        .find(|c| c == '/' || c == '?' || c == '#')
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    Some(format!("{}{}/", &url[..i + 3], &rest[..end]))
+}
+
 fn snapshot(task: &Shared) -> Option<Snap> {
     let t = task.lock().ok()?;
+    let (conn, has_referer) = t
+        .spawn
+        .as_ref()
+        .map(|s| (s.conn, s.extra.contains_key("Referer")))
+        .unwrap_or((0, false));
     Some(Snap {
         name: t.name.clone(),
+        url: t.url.clone(),
         kind: t.kind,
+        conn,
+        attempts: t.attempts,
+        has_referer,
+        elapsed: t.started.elapsed().as_secs_f32(),
         status: t.status,
         message: t.message.clone(),
         done: t.done,
@@ -2804,6 +3294,7 @@ impl eframe::App for App {
     /// 窗口收进托盘后 `ui` 不再运行，但 `logic` 仍会被定时调用：
     /// 托盘菜单、关窗拦截和提示刷新都放这里。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_bridge(ctx);
         #[cfg(feature = "enhanced")]
         {
             self.handle_shell(ctx);
@@ -2814,8 +3305,6 @@ impl eframe::App for App {
             self.pump_queue();
             self.apply_schedule();
         }
-        #[cfg(not(feature = "enhanced"))]
-        let _ = ctx;
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -3396,66 +3885,130 @@ impl eframe::App for App {
                                         && snap.status != Status::Done
                                     {
                                         ui.add_space(4.0);
-                                        let color = if snap.status == Status::Failed {
-                                            DANGER
-                                        } else {
-                                            MUTED
-                                        };
-                                        ui.label(
-                                            RichText::new(&snap.message).size(11.5).color(color),
-                                        );
-                                        // 失败时给一个能点的下一步，而不是只报错
-                                        #[cfg(feature = "enhanced")]
                                         if snap.status == Status::Failed {
+                                            let issue = clinic::classify(
+                                                &snap.message,
+                                                snap.kind,
+                                                snap.has_referer,
+                                            );
+                                            ui.horizontal_wrapped(|ui| {
+                                                pill(ui, issue.code, ACCENT, tint(ACCENT, 26));
+                                                ui.label(
+                                                    RichText::new(issue.title)
+                                                        .size(12.0)
+                                                        .strong()
+                                                        .color(DANGER),
+                                                );
+                                                if snap.attempts > 0 {
+                                                    pill(
+                                                        ui,
+                                                        &format!("已重试 {} 次", snap.attempts),
+                                                        MUTED,
+                                                        PANEL,
+                                                    );
+                                                }
+                                            });
+                                            ui.label(
+                                                RichText::new(issue.detail)
+                                                    .size(11.0)
+                                                    .color(SECONDARY),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!("建议：{}", issue.advice))
+                                                    .size(10.5)
+                                                    .color(MUTED),
+                                            );
                                             ui.add_space(4.0);
-                                            ui.horizontal(|ui| {
-                                                let m = snap.message.as_str();
-                                                if m.contains("aria2") {
+                                            ui.horizontal_wrapped(|ui| {
+                                                let mut n = 0;
+                                                if issue.use_referer && !snap.has_referer && n < 3 {
+                                                    if ui
+                                                        .button("补来源页重试")
+                                                        .on_hover_text(
+                                                            "把链接所在站点的首页作为 Referer",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        card_action = Some(CardAction::Retry(
+                                                            task.clone(),
+                                                            clinic::Retry::WithReferer,
+                                                        ));
+                                                    }
+                                                    n += 1;
+                                                }
+                                                if issue.retryable && n < 3 {
+                                                    if ui.button("重试").clicked() {
+                                                        card_action = Some(CardAction::Retry(
+                                                            task.clone(),
+                                                            clinic::Retry::Keep,
+                                                        ));
+                                                    }
+                                                    n += 1;
+                                                }
+                                                if issue.single && n < 3 {
+                                                    if ui.button("单连接重试").clicked() {
+                                                        card_action = Some(CardAction::Retry(
+                                                            task.clone(),
+                                                            clinic::Retry::Single,
+                                                        ));
+                                                    }
+                                                    n += 1;
+                                                }
+                                                if issue.login && n < 3 {
+                                                    if ui.button("打开网页登录").clicked() {
+                                                        card_action = Some(CardAction::OpenUrl(
+                                                            snap.url.clone(),
+                                                        ));
+                                                    }
+                                                    n += 1;
+                                                }
+                                                if issue.settings && n < 3 {
+                                                    if ui.button("换下载目录").clicked() {
+                                                        card_action =
+                                                            Some(CardAction::Settings);
+                                                    }
+                                                    n += 1;
+                                                }
+                                                #[cfg(feature = "enhanced")]
+                                                if issue.start_service && n < 3 {
                                                     if ui.button("启动服务").clicked() {
-                                                        card_action = Some(CardAction::Services);
+                                                        card_action =
+                                                            Some(CardAction::StartService);
                                                     }
-                                                } else if m.contains("403")
-                                                    || m.contains("401")
-                                                    || m.contains("Cookie")
-                                                    || m.contains("登录")
-                                                {
-                                                    if ui.button("去账号页").clicked() {
-                                                        card_action = Some(CardAction::Accounts);
-                                                    }
-                                                } else if m.contains("磁盘空间") {
-                                                    if ui.button("去设置换目录").clicked() {
-                                                        card_action = Some(CardAction::Settings);
-                                                    }
-                                                } else if m.contains("yt-dlp")
-                                                    || m.contains("ffmpeg")
-                                                    || m.contains("缺少")
-                                                {
+                                                    n += 1;
+                                                }
+                                                #[cfg(feature = "enhanced")]
+                                                if issue.install_deps && n < 3 {
                                                     if ui.button("补齐组件").clicked() {
-                                                        card_action = Some(CardAction::Settings);
+                                                        card_action =
+                                                            Some(CardAction::Settings);
                                                     }
+                                                    n += 1;
                                                 }
-                                                if ui.button("复制错误").clicked() {
-                                                    card_action = Some(CardAction::CopyError(
-                                                        snap.message.clone(),
-                                                    ));
-                                                }
-                                            });
-                                        }
-                                        #[cfg(not(feature = "enhanced"))]
-                                        if snap.status == Status::Failed {
-                                            ui.add_space(4.0);
-                                            ui.horizontal(|ui| {
-                                                if snap.message.contains("磁盘空间")
-                                                    && ui.button("去设置换目录").clicked()
-                                                {
-                                                    card_action = Some(CardAction::Settings);
-                                                }
-                                                if ui.button("复制错误").clicked() {
-                                                    card_action = Some(CardAction::CopyError(
-                                                        snap.message.clone(),
-                                                    ));
+                                                if ui.button("复制报告").clicked() {
+                                                    let text = clinic::report(
+                                                        &clinic::ReportCtx {
+                                                            name: &snap.name,
+                                                            url: &snap.url,
+                                                            kind: snap.kind.label(),
+                                                            conn: snap.conn,
+                                                            attempts: snap.attempts,
+                                                            elapsed: snap.elapsed,
+                                                            message: &snap.message,
+                                                            log: &snap.log,
+                                                        },
+                                                        &issue,
+                                                    );
+                                                    card_action =
+                                                        Some(CardAction::CopyReport(text));
                                                 }
                                             });
+                                        } else {
+                                            ui.label(
+                                                RichText::new(&snap.message)
+                                                    .size(11.5)
+                                                    .color(MUTED),
+                                            );
                                         }
                                     }
                                     if let Some(out) = &snap.output {
@@ -3582,15 +4135,28 @@ impl eframe::App for App {
                         }
                     });
                 match card_action {
-                    #[cfg(feature = "enhanced")]
-                    Some(CardAction::Services) => self.start_services(),
-                    #[cfg(feature = "enhanced")]
-                    Some(CardAction::Accounts) => self.page = Page::Accounts,
-                    Some(CardAction::Settings) => self.page = Page::Settings,
-                    Some(CardAction::CopyError(m)) => {
-                        clipboard_set(&m);
-                        self.notify("错误信息已复制");
+                    Some(CardAction::Retry(t, mode)) => {
+                        let (conn, extra) = match mode {
+                            clinic::Retry::Keep => (None, None),
+                            clinic::Retry::Single => (Some(1), None),
+                            clinic::Retry::WithReferer => (None, referer_extra(&t)),
+                        };
+                        if !engine::retry_task(self.root.clone(), t, conn, extra) {
+                            self.notify("这个任务还没有启动参数，请重新添加链接");
+                        }
                     }
+                    Some(CardAction::OpenUrl(u)) => {
+                        if let Err(e) = shell_exec(std::path::Path::new(&u), None) {
+                            self.notify(e);
+                        }
+                    }
+                    Some(CardAction::Settings) => self.page = Page::Settings,
+                    Some(CardAction::CopyReport(text)) => {
+                        clipboard_set(&text);
+                        self.notify("诊所报告已复制");
+                    }
+                    #[cfg(feature = "enhanced")]
+                    Some(CardAction::StartService) => self.start_services(),
                     #[cfg(feature = "enhanced")]
                     Some(CardAction::Quarantine(p)) => {
                         match av::quarantine(&self.root, &p, "用户确认隔离") {
@@ -3639,6 +4205,9 @@ impl eframe::App for App {
                 }
                 self.selected = selected_now.min(self.tasks.len().saturating_sub(1));
             });
+
+        self.draw_guide(ui.ctx());
+        self.draw_browser_help(ui.ctx());
     }
 }
 
@@ -4017,12 +4586,16 @@ fn shell_exec(path: &std::path::Path, _params: Option<&str>) -> Result<(), Strin
         .map_err(|e| e.to_string())
 }
 
-fn open_path(path: &std::path::Path) -> Result<(), String> {
+pub(crate) fn open_path(path: &std::path::Path) -> Result<(), String> {
     shell_exec(path, None)
 }
 
 fn main() -> eframe::Result {
     setup::install_panic_hook();
+    // Chrome / Edge 拉起 native messaging host 时，只走 stdio，不开窗口
+    if std::env::args().nth(1).as_deref() == Some("--native-host") {
+        std::process::exit(bridge::native_host_main());
+    }
     if std::env::args().nth(1).as_deref() == Some("--open") {
         let p = std::env::args().nth(2).unwrap_or_default();
         match open_path(std::path::Path::new(&p)) {
@@ -4057,6 +4630,10 @@ fn main() -> eframe::Result {
     #[cfg(feature = "enhanced")]
     if std::env::args().nth(1).as_deref() == Some("--mcp") {
         std::process::exit(mcp::run());
+    }
+    // 单实例：已有窗口在运行时，把它叫到前台，本次直接退出
+    if bridge::notify_existing() {
+        return Ok(());
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
