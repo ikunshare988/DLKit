@@ -3,18 +3,29 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// 轻量版只保留：高速下载引擎、页面解析、基础设置。
+// 其余模块仅在增强版编译，让轻量版里没有对应代码。
+#[cfg(feature = "enhanced")]
 mod accounts;
+#[cfg(feature = "enhanced")]
 mod av;
+#[cfg(feature = "enhanced")]
 mod deps;
+#[cfg(feature = "enhanced")]
 mod diag;
 mod engine;
+#[cfg(feature = "enhanced")]
 mod mcp;
 mod platform;
+#[cfg(feature = "enhanced")]
 mod policy;
 mod scanner;
 mod setup;
+#[cfg(feature = "enhanced")]
 mod tray;
+#[cfg(feature = "enhanced")]
 mod update;
+#[cfg(feature = "enhanced")]
 mod watch;
 
 use engine::{Shared, Status, Task};
@@ -79,12 +90,16 @@ struct Config {
     /// 全局限速（MB/s），0 表示不限
     limit: f64,
     /// 增强版：下载完成后自动做安全检查
+    #[cfg(feature = "enhanced")]
     av_auto: bool,
     /// 增强版：调用 Windows Defender 单文件扫描
+    #[cfg(feature = "enhanced")]
     av_defender: bool,
     /// 增强版：超过这个大小跳过 Defender
+    #[cfg(feature = "enhanced")]
     av_max_gb: f64,
     /// 增强版：先下到沙箱，检查通过后再放行
+    #[cfg(feature = "enhanced")]
     av_sandbox: bool,
 }
 
@@ -98,9 +113,13 @@ impl Default for Config {
             conn: 32,
             engine: "auto".into(),
             limit: 0.0,
+            #[cfg(feature = "enhanced")]
             av_auto: true,
+            #[cfg(feature = "enhanced")]
             av_defender: true,
+            #[cfg(feature = "enhanced")]
             av_max_gb: 4.0,
+            #[cfg(feature = "enhanced")]
             av_sandbox: true,
         }
     }
@@ -117,9 +136,13 @@ fn load_config() -> Config {
         conn: Option<usize>,
         engine: Option<String>,
         limit: Option<f64>,
+        #[cfg(feature = "enhanced")]
         av_auto: Option<bool>,
+        #[cfg(feature = "enhanced")]
         av_defender: Option<bool>,
+        #[cfg(feature = "enhanced")]
         av_max_gb: Option<f64>,
+        #[cfg(feature = "enhanced")]
         av_sandbox: Option<bool>,
     }
     let mut cfg = Config::default();
@@ -137,17 +160,20 @@ fn load_config() -> Config {
             if let Some(l) = raw.limit {
                 cfg.limit = l.clamp(0.0, 100.0);
             }
-            if let Some(v) = raw.av_auto {
-                cfg.av_auto = v;
-            }
-            if let Some(v) = raw.av_defender {
-                cfg.av_defender = v;
-            }
-            if let Some(v) = raw.av_max_gb {
-                cfg.av_max_gb = v.clamp(0.1, 100.0);
-            }
-            if let Some(v) = raw.av_sandbox {
-                cfg.av_sandbox = v;
+            #[cfg(feature = "enhanced")]
+            {
+                if let Some(v) = raw.av_auto {
+                    cfg.av_auto = v;
+                }
+                if let Some(v) = raw.av_defender {
+                    cfg.av_defender = v;
+                }
+                if let Some(v) = raw.av_max_gb {
+                    cfg.av_max_gb = v.clamp(0.1, 100.0);
+                }
+                if let Some(v) = raw.av_sandbox {
+                    cfg.av_sandbox = v;
+                }
             }
         }
     }
@@ -155,23 +181,33 @@ fn load_config() -> Config {
 }
 
 fn save_config(cfg: &Config) {
-    let v = serde_json::json!({
+    #[allow(unused_mut)]
+    let mut v = serde_json::json!({
         "dir": cfg.dir.to_string_lossy(),
         "conn": cfg.conn,
         "engine": cfg.engine,
-        "limit": cfg.limit,
-        "av_auto": cfg.av_auto,
-        "av_defender": cfg.av_defender,
-        "av_max_gb": cfg.av_max_gb,
-        "av_sandbox": cfg.av_sandbox
+        "limit": cfg.limit
+
+
+
+
     });
+    #[cfg(feature = "enhanced")]
+    {
+        v["av_auto"] = cfg.av_auto.into();
+        v["av_defender"] = cfg.av_defender.into();
+        v["av_max_gb"] = cfg.av_max_gb.into();
+        v["av_sandbox"] = cfg.av_sandbox.into();
+    }
     let _ = std::fs::write(config_path(), v.to_string());
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Download,
+    #[cfg(feature = "enhanced")]
     Watch,
+    #[cfg(feature = "enhanced")]
     Accounts,
     Settings,
 }
@@ -179,18 +215,24 @@ enum Page {
 /// 任务卡片里点了动作后要做的事：先记下来，等遍历结束再改 self，
 /// 避免和 `self.tasks.iter()` 的借用冲突。
 enum CardAction {
+    #[cfg(feature = "enhanced")]
     Services,
+    #[cfg(feature = "enhanced")]
     Accounts,
     Settings,
     CopyError(String),
+    #[cfg(feature = "enhanced")]
     Quarantine(PathBuf),
+    #[cfg(feature = "enhanced")]
     AcceptAv(PathBuf),
+    #[cfg(feature = "enhanced")]
     Release(PathBuf),
     Notice(String),
 }
 
 struct App {
     url: String,
+    #[cfg(feature = "enhanced")]
     ol_path: String,
     dir_text: String,
     cfg: Config,
@@ -199,13 +241,18 @@ struct App {
     toast: String,
     toast_at: Instant,
     root: PathBuf,
+    #[cfg(feature = "enhanced")]
     svc_online: bool,
+    #[cfg(feature = "enhanced")]
     svc_checked: Instant,
     scan: Option<scanner::ScanShared>,
     page: Page,
+    #[cfg(feature = "enhanced")]
     deps: deps::Installer,
+    #[cfg(feature = "enhanced")]
     acc: accounts::Accounts,
     /// 账号页的保存/测试结果
+    #[cfg(feature = "enhanced")]
     acc_msg: String,
     /// 用户点过「自己选」后，收起平台推荐横幅
     scan_hint_hidden: bool,
@@ -213,41 +260,59 @@ struct App {
     clip_last: String,
     clip_at: Instant,
     /// 托盘图标（创建失败时为 None，此时关窗即退出）
+    #[cfg(feature = "enhanced")]
     tray: Option<tray::Tray>,
     /// 关闭窗口 = 退出程序（托盘「退出」或更新重启时置位）
+    #[cfg(feature = "enhanced")]
     allow_close: bool,
+    #[cfg(feature = "enhanced")]
     close_sent: bool,
+    #[cfg(feature = "enhanced")]
     tip_at: Instant,
+    #[cfg(feature = "enhanced")]
     updater: update::Updater,
     /// 上一次看到的更新提示，避免同一个提示反复弹
+    #[cfg(feature = "enhanced")]
     upd_msg: String,
     /// 链接跟踪（后台线程定时检查直链是否更新）
+    #[cfg(feature = "enhanced")]
     watch: watch::Watcher,
     /// 首次运行检查结果（目录是否可写、是否自动生成了配置）
     layout: setup::Layout,
     /// 待安装的依赖 key（首次引导的「一键补齐」按顺序安装）
+    #[cfg(feature = "enhanced")]
     install_queue: Vec<&'static str>,
     /// aria2 装好后是否要顺手启动服务（添加磁力时触发）
+    #[cfg(feature = "enhanced")]
     want_services: bool,
     /// 环境检查的后台结果
+    #[cfg(feature = "enhanced")]
     diag_rx: Option<std::sync::mpsc::Receiver<Vec<diag::Check>>>,
+    #[cfg(feature = "enhanced")]
     diag_checks: Option<Vec<diag::Check>>,
     /// 上次异常退出的日志，提示过一次后清空
+    #[cfg(feature = "enhanced")]
     crash_log: Option<PathBuf>,
     /// 程序启动以来的日志（启动、初始化、运行时事件）
     boot_at: Instant,
     app_log: Vec<String>,
     log_tab: LogTab,
     /// 已经安排过安全检查的文件（按路径去重）
+    #[cfg(feature = "enhanced")]
     av_scanned: std::collections::HashSet<PathBuf>,
     /// 云端信誉配置（VirusTotal，可选）
+    #[cfg(feature = "enhanced")]
     cloud: av::CloudCfg,
     /// 增强版策略：按站点覆盖参数、全局预算、时段限速
+    #[cfg(feature = "enhanced")]
     policy: policy::Policy,
     /// 已经应用过的限速值（用于判断时段切换）
+    #[cfg(feature = "enhanced")]
     sched_applied: Option<f64>,
+    #[cfg(feature = "enhanced")]
     sched_at: Instant,
     /// 因资源预算而排队的任务（增强版）
+    #[cfg(feature = "enhanced")]
     pending: Vec<(Shared, engine::SpawnArgs, i32)>,
 }
 
@@ -295,6 +360,7 @@ fn boot_line(t0: Instant, msg: impl AsRef<str>) -> String {
     format!("[{:>6.2}s] {}", t0.elapsed().as_secs_f32(), msg.as_ref())
 }
 
+#[cfg(feature = "enhanced")]
 fn tcp_open(port: u16) -> bool {
     use std::net::{SocketAddr, TcpStream};
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
@@ -307,26 +373,39 @@ impl App {
         let root = engine::find_root();
         // 首次运行：补齐目录与 aria2 配置，用户不用手动复制示例文件
         let layout = setup::ensure_layout(&root);
+        #[cfg(feature = "enhanced")]
         let crash_log = setup::last_crash(&root);
         let cfg = load_config();
         engine::set_speed_limit(cfg.limit);
+        #[cfg(feature = "enhanced")]
         let tray = tray::Tray::new();
-        let updater = update::Updater::new();
-        updater.check();
+        #[cfg(feature = "enhanced")]
+        let updater = {
+            let u = update::Updater::new();
+            u.check();
+            u
+        };
+        #[cfg(feature = "enhanced")]
         let acc = accounts::Accounts::load(&root);
+        #[cfg(feature = "enhanced")]
         let watch = watch::Watcher::new(&root);
+        #[cfg(feature = "enhanced")]
         let cloud = av::load_cloud(&root);
         let created_conf = layout.created_conf;
-        let root_for_policy = root.clone();
-        let policy = if ENHANCED {
-            policy::Policy::load(&root_for_policy)
-        } else {
-            policy::Policy::default()
-        };
+        #[cfg(feature = "enhanced")]
+        let policy = policy::Policy::load(&root);
 
         // 启动日志：从版本、路径到依赖与服务状态，排障时先看这一段
         let mut app_log: Vec<String> = Vec::new();
         app_log.push(boot_line(boot_at, format!("DLKit {} 启动", env!("CARGO_PKG_VERSION"))));
+        app_log.push(boot_line(
+            boot_at,
+            if ENHANCED {
+                "版本类型：增强版"
+            } else {
+                "版本类型：轻量版"
+            },
+        ));
         app_log.push(boot_line(
             boot_at,
             format!("程序目录：{}", root.display()),
@@ -354,10 +433,13 @@ impl App {
         if created_conf {
             app_log.push(boot_line(boot_at, "首次运行：已生成 config/aria2.conf"));
         }
+        #[cfg(feature = "enhanced")]
         if crash_log.is_some() {
             app_log.push(boot_line(boot_at, "检测到上次异常退出的日志"));
         }
+        #[cfg(feature = "enhanced")]
         app_log.push(boot_line(boot_at, format!("策略：{}", policy.describe())));
+        #[cfg(feature = "enhanced")]
         for dep in deps::DEPS {
             let ok = deps::installed(&root, dep);
             app_log.push(boot_line(
@@ -373,6 +455,7 @@ impl App {
                 ),
             ));
         }
+        #[cfg(feature = "enhanced")]
         app_log.push(boot_line(
             boot_at,
             format!(
@@ -384,28 +467,31 @@ impl App {
                 }
             ),
         ));
-        let bili = match acc.bili_mode.as_str() {
-            accounts::MODE_BROWSER => format!("从 {} 读取 Cookie", acc.bili_browser),
-            accounts::MODE_MANUAL => "手动粘贴的 Cookie".to_string(),
-            _ => "未配置".to_string(),
-        };
-        app_log.push(boot_line(boot_at, format!("B站账号：{}", bili)));
-        app_log.push(boot_line(
-            boot_at,
-            format!(
-                "OpenList：{}",
-                if acc.ol_base.trim().is_empty() {
-                    "未配置"
-                } else {
-                    acc.ol_base.as_str()
-                }
-            ),
-        ));
-        app_log.push(boot_line(
-            boot_at,
-            format!("链接跟踪：{} 个条目", watch.snapshot().len()),
-        ));
-        app_log.push(boot_line(boot_at, "已开始检查更新"));
+        #[cfg(feature = "enhanced")]
+        {
+            let bili = match acc.bili_mode.as_str() {
+                accounts::MODE_BROWSER => format!("从 {} 读取 Cookie", acc.bili_browser),
+                accounts::MODE_MANUAL => "手动粘贴的 Cookie".to_string(),
+                _ => "未配置".to_string(),
+            };
+            app_log.push(boot_line(boot_at, format!("B站账号：{}", bili)));
+            app_log.push(boot_line(
+                boot_at,
+                format!(
+                    "OpenList：{}",
+                    if acc.ol_base.trim().is_empty() {
+                        "未配置"
+                    } else {
+                        acc.ol_base.as_str()
+                    }
+                ),
+            ));
+            app_log.push(boot_line(
+                boot_at,
+                format!("链接跟踪：{} 个条目", watch.snapshot().len()),
+            ));
+            app_log.push(boot_line(boot_at, "已开始检查更新"));
+        }
         app_log.push(boot_line(
             boot_at,
             format!("初始化完成（{} ms）", boot_at.elapsed().as_millis()),
@@ -413,6 +499,7 @@ impl App {
 
         let app = App {
             url: String::new(),
+            #[cfg(feature = "enhanced")]
             ol_path: String::new(),
             dir_text: cfg.dir.to_string_lossy().to_string(),
             cfg,
@@ -421,42 +508,67 @@ impl App {
             toast: String::new(),
             toast_at: Instant::now() - Duration::from_secs(10),
             root,
+            #[cfg(feature = "enhanced")]
             svc_online: false,
+            #[cfg(feature = "enhanced")]
             svc_checked: Instant::now() - Duration::from_secs(10),
             scan: None,
             page: Page::Download,
+            #[cfg(feature = "enhanced")]
             deps: deps::Installer::new(),
+            #[cfg(feature = "enhanced")]
             acc,
+            #[cfg(feature = "enhanced")]
             acc_msg: String::new(),
             scan_hint_hidden: false,
             // 启动时已有的剪贴板内容不算「新复制」，避免一打开就自动填入
             clip_last: clipboard_text().unwrap_or_default(),
             clip_at: Instant::now(),
+            #[cfg(feature = "enhanced")]
             tray,
+            #[cfg(feature = "enhanced")]
             allow_close: false,
+            #[cfg(feature = "enhanced")]
             close_sent: false,
+            #[cfg(feature = "enhanced")]
             tip_at: Instant::now(),
+            #[cfg(feature = "enhanced")]
             updater,
+            #[cfg(feature = "enhanced")]
             upd_msg: String::new(),
+            #[cfg(feature = "enhanced")]
             watch,
             layout,
+            #[cfg(feature = "enhanced")]
             install_queue: Vec::new(),
+            #[cfg(feature = "enhanced")]
             want_services: false,
+            #[cfg(feature = "enhanced")]
             diag_rx: None,
+            #[cfg(feature = "enhanced")]
             diag_checks: None,
+            #[cfg(feature = "enhanced")]
             crash_log,
             boot_at,
             app_log,
             log_tab: LogTab::Program,
+            #[cfg(feature = "enhanced")]
             av_scanned: std::collections::HashSet::new(),
+            #[cfg(feature = "enhanced")]
             cloud,
+            #[cfg(feature = "enhanced")]
             policy,
+            #[cfg(feature = "enhanced")]
             sched_applied: None,
+            #[cfg(feature = "enhanced")]
             sched_at: Instant::now() - Duration::from_secs(60),
+            #[cfg(feature = "enhanced")]
             pending: Vec::new(),
         };
+        #[allow(unused_mut)]
         let mut app = app;
         if created_conf {
+            #[cfg(feature = "enhanced")]
             app.notify("已自动生成 aria2 配置，可以直接使用");
         }
         app
@@ -464,14 +576,15 @@ impl App {
 
     /// 任务保存目录：增强版开启沙箱时先落在沙箱里
     fn task_dir(&self) -> PathBuf {
-        if ENHANCED && self.cfg.av_sandbox {
-            av::sandbox_dir(&self.cfg.dir)
-        } else {
-            self.cfg.dir.clone()
+        #[cfg(feature = "enhanced")]
+        if self.cfg.av_sandbox {
+            return av::sandbox_dir(&self.cfg.dir);
         }
+        self.cfg.dir.clone()
     }
 
     /// 下载完成后自动做安全检查（增强版）
+    #[cfg(feature = "enhanced")]
     fn poll_av(&mut self) {
         if !ENHANCED || !self.cfg.av_auto {
             return;
@@ -518,6 +631,7 @@ impl App {
     }
 
     /// 修改某个已下载文件对应的安全检查结果
+    #[cfg(feature = "enhanced")]
     fn update_av(&self, path: &std::path::Path, mut f: impl FnMut(&mut av::Report)) {
         for t in &self.tasks {
             if let Ok(mut task) = t.lock() {
@@ -532,9 +646,18 @@ impl App {
 
     /// 按策略取这个任务该用的并发数
     fn task_conn(&self, url: &str, kind: engine::Kind) -> usize {
-        self.policy.conn_for(url, kind_key(kind), self.cfg.conn)
+        #[cfg(feature = "enhanced")]
+        {
+            return self.policy.conn_for(url, kind_key(kind), self.cfg.conn);
+        }
+        #[cfg(not(feature = "enhanced"))]
+        {
+            let _ = (url, kind);
+            self.cfg.conn
+        }
     }
 
+    #[cfg(feature = "enhanced")]
     fn running_count(&self) -> usize {
         self.tasks
             .iter()
@@ -572,13 +695,14 @@ impl App {
             extra,
         };
         // 策略里的单任务限速
+        #[cfg(feature = "enhanced")]
         if let Some(v) = self.policy.limit_for(url, kind_key(kind)) {
             if let Ok(mut t) = shared.lock() {
                 t.rate = Some(Arc::new(engine::TaskRate::new(v)));
             }
         }
-        let limit = if ENHANCED { self.policy.max_active() } else { None };
-        if let Some(limit) = limit {
+        #[cfg(feature = "enhanced")]
+        if let Some(limit) = self.policy.max_active() {
             if self.running_count() >= limit {
                 if let Ok(mut t) = shared.lock() {
                     t.status = Status::Queued;
@@ -611,10 +735,8 @@ impl App {
     }
 
     /// 有任务结束时，按优先级把排队的任务放出来
+    #[cfg(feature = "enhanced")]
     fn pump_queue(&mut self) {
-        if !ENHANCED {
-            return;
-        }
         let Some(limit) = self.policy.max_active() else {
             return;
         };
@@ -640,6 +762,7 @@ impl App {
     }
 
     /// 时段限速：命中规则时覆盖用户的限速值，离开时段后恢复
+    #[cfg(feature = "enhanced")]
     fn apply_schedule(&mut self) {
         if self.sched_at.elapsed() < Duration::from_secs(30) {
             return;
@@ -661,6 +784,7 @@ impl App {
     }
 
     /// 依赖安装队列：一次装一个，装完自动接下一个
+    #[cfg(feature = "enhanced")]
     fn poll_installs(&mut self) {
         let st = self.deps.state();
         if matches!(st.phase, deps::Phase::Downloading | deps::Phase::Extracting) {
@@ -699,6 +823,7 @@ impl App {
         }
     }
 
+    #[cfg(feature = "enhanced")]
     fn aria2_installed(&self) -> bool {
         deps::DEPS
             .iter()
@@ -708,6 +833,7 @@ impl App {
     }
 
     /// 补齐全缺的组件（按顺序安装，不并发）
+    #[cfg(feature = "enhanced")]
     fn install_missing(&mut self) {
         let missing: Vec<&'static str> = deps::DEPS
             .iter()
@@ -723,6 +849,7 @@ impl App {
     }
 
     /// 磁力 / 种子依赖 aria2：没有就自动装，装完自动启动服务
+    #[cfg(feature = "enhanced")]
     fn ensure_aria2(&mut self) {
         if self.aria2_installed() {
             self.notify("磁力 / 种子需要 aria2，正在启动服务…");
@@ -736,6 +863,7 @@ impl App {
         self.notify("磁力 / 种子需要 aria2，正在自动安装…");
     }
 
+    #[cfg(feature = "enhanced")]
     fn poll_diag(&mut self) {
         let Some(rx) = &self.diag_rx else {
             return;
@@ -753,6 +881,7 @@ impl App {
     }
 
     /// 环境检查放到后台线程，避免网络探测卡住界面
+    #[cfg(feature = "enhanced")]
     fn run_diag(&mut self) {
         if self.diag_rx.is_some() {
             return;
@@ -771,6 +900,7 @@ impl App {
 
     /// 首次使用 / 异常退出 / 目录不可写 的顶部提示
     fn draw_first_run(&mut self, ui: &mut egui::Ui) {
+        #[cfg(feature = "enhanced")]
         if let Some(p) = self.crash_log.clone() {
             egui::Frame::NONE
                 .fill(DANGER_BG)
@@ -836,13 +966,17 @@ impl App {
             ui.add_space(8.0);
         }
 
+        #[cfg(feature = "enhanced")]
         let missing: Vec<&'static deps::Dep> = deps::DEPS
             .iter()
             .filter(|d| !deps::installed(&self.root, d))
             .collect();
+        #[cfg(feature = "enhanced")]
         if missing.is_empty() {
             return;
         }
+        #[cfg(feature = "enhanced")]
+        {
         let st = self.deps.state();
         let busy = matches!(st.phase, deps::Phase::Downloading | deps::Phase::Extracting);
         card_frame().show(ui, |ui| {
@@ -877,9 +1011,11 @@ impl App {
             }
         });
         ui.add_space(8.0);
+        }
     }
 
     /// 启动 aria2（带 start.ps1 的完整包会连 OpenList 一起起；单文件版直接拉 aria2c）
+    #[cfg(feature = "enhanced")]
     fn start_services(&mut self) {
         let aria = self.root.join("bin").join("aria2").join("aria2c.exe");
         let conf = self.root.join("config").join("aria2.conf");
@@ -931,6 +1067,7 @@ impl App {
     }
 
     /// 账号页：B 站 Cookie 与网盘（OpenList）登录
+    #[cfg(feature = "enhanced")]
     fn draw_accounts(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -1116,7 +1253,9 @@ impl App {
 
     /// 设置页：下载参数、依赖补齐、更新
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
+        #[cfg(feature = "enhanced")]
         let st = self.deps.state();
+        #[cfg(feature = "enhanced")]
         let busy = matches!(
             st.phase,
             deps::Phase::Downloading | deps::Phase::Extracting
@@ -1214,6 +1353,8 @@ impl App {
                         });
                 });
 
+                #[cfg(feature = "enhanced")]
+                {
                 ui.add_space(12.0);
 
                 card_frame().show(ui, |ui| {
@@ -1521,10 +1662,12 @@ impl App {
                         });
                     }
                 });
+                }
             });
     }
 
     /// 托盘事件、关窗拦截、托盘提示刷新
+    #[cfg(feature = "enhanced")]
     fn handle_shell(&mut self, ctx: &egui::Context) {
         use egui::ViewportCommand;
 
@@ -1578,6 +1721,7 @@ impl App {
     }
 
     /// 正在下载/排队的任务数与合计速度
+    #[cfg(feature = "enhanced")]
     fn active_stats(&self) -> (usize, f64) {
         let mut n = 0usize;
         let mut speed = 0.0f64;
@@ -1593,6 +1737,7 @@ impl App {
     }
 
     /// 跟踪页：直链更新检测列表（只提示，不自动下载）
+    #[cfg(feature = "enhanced")]
     fn draw_watch(&mut self, ui: &mut egui::Ui) {
         let items = self.watch.snapshot();
         card_frame().show(ui, |ui| {
@@ -1696,6 +1841,7 @@ impl App {
     }
 
     /// 把跟踪项交给下载引擎（用户手动确认后才调用）
+    #[cfg(feature = "enhanced")]
     fn download_watched(&mut self, it: &watch::WatchItem) {
         let (kind, _) = engine::classify(&it.url);
         let task = Task::new(it.url.clone(), kind, it.name.clone());
@@ -1715,6 +1861,7 @@ impl App {
     }
 
     /// 把输入框里的直链加入跟踪
+    #[cfg(feature = "enhanced")]
     fn add_watch(&mut self) {
         let url = self.url.trim().to_string();
         if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -1737,6 +1884,7 @@ impl App {
     }
 
     /// 自动更新横幅
+    #[cfg(feature = "enhanced")]
     fn draw_update(&mut self, ui: &mut egui::Ui) {
         let st = self.updater.state();
         if st.phase == update::Phase::Idle {
@@ -2170,14 +2318,27 @@ impl App {
 
     fn add_task(&mut self) {
         let raw = self.url.trim().to_string();
+        #[cfg(feature = "enhanced")]
         let ol = self.ol_path.trim().to_string();
+
+        #[cfg(feature = "enhanced")]
         if raw.is_empty() && ol.is_empty() {
             self.notify("请输入下载链接或 OpenList 路径");
             return;
         }
+        #[cfg(not(feature = "enhanced"))]
+        if raw.is_empty() {
+            self.notify("请先粘贴下载链接");
+            return;
+        }
+
+        #[cfg(feature = "enhanced")]
+        let only_url = ol.is_empty();
+        #[cfg(not(feature = "enhanced"))]
+        let only_url = true;
 
         // 一次粘贴多行链接：逐行入队，空行和 # 注释跳过
-        if ol.is_empty() && raw.contains('\n') {
+        if only_url && raw.contains('\n') {
             let lines: Vec<String> = raw
                 .lines()
                 .map(|l| l.trim().to_string())
@@ -2187,6 +2348,10 @@ impl App {
                 let mut n = 0;
                 for l in lines {
                     let (kind, _) = engine::classify(&l);
+                    #[cfg(not(feature = "enhanced"))]
+                    if kind != engine::Kind::Http {
+                        continue;
+                    }
                     self.push_task(l, kind, None);
                     n += 1;
                 }
@@ -2196,20 +2361,32 @@ impl App {
             }
         }
 
+        #[cfg(feature = "enhanced")]
         if !ol.is_empty() {
             let task_url = format!("openlist:{}", ol);
             self.push_task(task_url, engine::Kind::OpenList, Some(ol));
             self.ol_path.clear();
-        } else {
-            let (kind, _) = engine::classify(&raw);
-            self.push_task(raw, kind, None);
+            self.url.clear();
+            save_config(&self.cfg);
+            return;
         }
+        let (kind, _why) = engine::classify(&raw);
+        #[cfg(not(feature = "enhanced"))]
+        if kind != engine::Kind::Http {
+            self.notify(format!(
+                "轻量版只支持直链与下载页里的文件；{}请用增强版",
+                _why
+            ));
+            return;
+        }
+        self.push_task(raw, kind, None);
         self.url.clear();
         save_config(&self.cfg);
     }
 
     fn push_task(&mut self, url: String, kind: engine::Kind, ol: Option<String>) {
         // 磁力 / 种子走 aria2：缺组件时自动装，装好自动起服务，用户不用先看文档
+        #[cfg(feature = "enhanced")]
         if kind == engine::Kind::Torrent && !self.svc_online {
             self.ensure_aria2();
         }
@@ -2517,6 +2694,7 @@ struct Snap {
     disk_speed: f64,
     log: Vec<String>,
     output: Option<PathBuf>,
+    #[cfg(feature = "enhanced")]
     av: Option<av::Report>,
 }
 
@@ -2534,6 +2712,7 @@ fn snapshot(task: &Shared) -> Option<Snap> {
         disk_speed: t.disk_speed,
         log: t.log.clone(),
         output: t.output.clone(),
+        #[cfg(feature = "enhanced")]
         av: t.av.clone(),
     })
 }
@@ -2625,13 +2804,18 @@ impl eframe::App for App {
     /// 窗口收进托盘后 `ui` 不再运行，但 `logic` 仍会被定时调用：
     /// 托盘菜单、关窗拦截和提示刷新都放这里。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.handle_shell(ctx);
-        // 窗口收进托盘时也要继续推进依赖安装与检查结果
-        self.poll_installs();
-        self.poll_diag();
-        self.poll_av();
-        self.pump_queue();
-        self.apply_schedule();
+        #[cfg(feature = "enhanced")]
+        {
+            self.handle_shell(ctx);
+            // 窗口收进托盘时也要继续推进依赖安装与检查结果
+            self.poll_installs();
+            self.poll_diag();
+            self.poll_av();
+            self.pump_queue();
+            self.apply_schedule();
+        }
+        #[cfg(not(feature = "enhanced"))]
+        let _ = ctx;
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -2640,6 +2824,7 @@ impl eframe::App for App {
         self.poll_clipboard();
         self.take_dropped(ui);
 
+        #[cfg(feature = "enhanced")]
         if self.svc_checked.elapsed() > Duration::from_secs(2) {
             self.svc_online = "127.0.0.1:6800"
                 .parse::<std::net::SocketAddr>()
@@ -2671,7 +2856,7 @@ impl eframe::App for App {
                     ui.label(RichText::new("多功能下载器").size(12.5).color(SECONDARY));
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new(format!("v{}", update::Updater::current()))
+                        RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                             .size(11.0)
                             .color(MUTED),
                     );
@@ -2683,6 +2868,7 @@ impl eframe::App for App {
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        #[cfg(feature = "enhanced")]
                         if ui
                             .button("检查更新")
                             .on_hover_text("从 GitHub Releases 检查新版本")
@@ -2709,15 +2895,18 @@ impl eframe::App for App {
                             });
                             self.selected = 0;
                         }
-                        if !self.svc_online && ui.button("启动服务").clicked() {
-                            self.start_services();
+                        #[cfg(feature = "enhanced")]
+                        {
+                            if !self.svc_online && ui.button("启动服务").clicked() {
+                                self.start_services();
+                            }
+                            let (txt, fg, bg) = if self.svc_online {
+                                ("aria2 在线", SUCCESS, SUCCESS_BG)
+                            } else {
+                                ("aria2 离线", DANGER, DANGER_BG)
+                            };
+                            pill(ui, txt, fg, bg);
                         }
-                        let (txt, fg, bg) = if self.svc_online {
-                            ("aria2 在线", SUCCESS, SUCCESS_BG)
-                        } else {
-                            ("aria2 离线", DANGER, DANGER_BG)
-                        };
-                        pill(ui, txt, fg, bg);
                     });
                 });
                 // 顶栏底部细分隔线
@@ -2730,6 +2919,7 @@ impl eframe::App for App {
             });
 
         // ---------- 左侧导航 ----------
+        #[cfg(feature = "enhanced")]
         let missing = deps::DEPS
             .iter()
             .filter(|d| !deps::installed(&self.root, d))
@@ -2744,24 +2934,28 @@ impl eframe::App for App {
             )
             .show(ui, |ui| {
                 nav_item(ui, "下载", Page::Download, &mut self.page);
-                ui.add_space(4.0);
-                let updated = self.watch.count_updated();
-                let watch_label = if updated > 0 {
-                    format!("跟踪 · {}", updated)
-                } else {
-                    "跟踪".to_string()
-                };
-                nav_item(ui, &watch_label, Page::Watch, &mut self.page);
-                ui.add_space(4.0);
-                nav_item(ui, "账号", Page::Accounts, &mut self.page);
+                #[cfg(feature = "enhanced")]
+                {
+                    ui.add_space(4.0);
+                    let updated = self.watch.count_updated();
+                    let watch_label = if updated > 0 {
+                        format!("跟踪 · {}", updated)
+                    } else {
+                        "跟踪".to_string()
+                    };
+                    nav_item(ui, &watch_label, Page::Watch, &mut self.page);
+                    ui.add_space(4.0);
+                    nav_item(ui, "账号", Page::Accounts, &mut self.page);
+                }
                 ui.add_space(4.0);
                 nav_item(ui, "设置", Page::Settings, &mut self.page);
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    #[cfg(feature = "enhanced")]
                     if missing > 0 && ui.button(format!("缺 {} 个依赖", missing)).clicked() {
                         self.page = Page::Settings;
                     }
                     ui.label(
-                        RichText::new(format!("v{}", update::Updater::current()))
+                        RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                             .size(10.5)
                             .color(MUTED),
                     );
@@ -2788,8 +2982,12 @@ impl eframe::App for App {
                                 egui::TextEdit::singleline(&mut self.url)
                                     .frame(egui::Frame::NONE)
                                     .hint_text(
-                                        RichText::new("粘贴直链 / 磁力 / 下载页链接 / OpenList…")
-                                            .color(MUTED),
+                                        RichText::new(if ENHANCED {
+                                            "粘贴直链 / 磁力 / 下载页链接 / OpenList…"
+                                        } else {
+                                            "粘贴直链或下载页链接…"
+                                        })
+                                        .color(MUTED),
                                     )
                                     .desired_width(ui.available_width() - 200.0)
                                     .margin(egui::vec2(2.0, 5.0)),
@@ -2802,6 +3000,7 @@ impl eframe::App for App {
                             {
                                 self.start_scan();
                             }
+                            #[cfg(feature = "enhanced")]
                             if pill_button(ui, "跟踪")
                                 .on_hover_text("检测到这个直链有更新时弹通知（不会自动下载）")
                                 .clicked()
@@ -2813,6 +3012,7 @@ impl eframe::App for App {
                             }
                         });
                         ui.add_space(5.0);
+                        #[cfg(feature = "enhanced")]
                         ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new("OpenList 路径").size(11.5).color(MUTED));
                             ui.add(
@@ -2827,6 +3027,12 @@ impl eframe::App for App {
                                     .color(MUTED),
                             );
                         });
+                        #[cfg(not(feature = "enhanced"))]
+                        ui.label(
+                            RichText::new("并发 / 限速 / 目录 / 引擎在「设置」里")
+                                .size(10.5)
+                                .color(MUTED),
+                        );
                     });
                 if self.toast_at.elapsed() < Duration::from_secs(4) {
                     ui.add_space(4.0);
@@ -2946,15 +3152,18 @@ impl eframe::App for App {
                     self.draw_settings(ui);
                     return;
                 }
+                #[cfg(feature = "enhanced")]
                 if self.page == Page::Accounts {
                     self.draw_accounts(ui);
                     return;
                 }
+                #[cfg(feature = "enhanced")]
                 if self.page == Page::Watch {
                     self.draw_watch(ui);
                     return;
                 }
                 self.draw_first_run(ui);
+                #[cfg(feature = "enhanced")]
                 self.draw_update(ui);
                 if self.scan.is_some() {
                     self.draw_scan(ui);
@@ -2987,9 +3196,13 @@ impl eframe::App for App {
                                     .color(SECONDARY),
                             );
                             ui.label(
-                                RichText::new("支持直链 / 下载页解析 / 磁力 / 媒体站 / OpenList")
-                                    .size(11.5)
-                                    .color(MUTED),
+                                RichText::new(if ENHANCED {
+                                    "支持直链 / 下载页解析 / 磁力 / 媒体站 / OpenList"
+                                } else {
+                                    "支持直链与下载页解析"
+                                })
+                                .size(11.5)
+                                .color(MUTED),
                             );
                         });
                     });
@@ -3192,6 +3405,7 @@ impl eframe::App for App {
                                             RichText::new(&snap.message).size(11.5).color(color),
                                         );
                                         // 失败时给一个能点的下一步，而不是只报错
+                                        #[cfg(feature = "enhanced")]
                                         if snap.status == Status::Failed {
                                             ui.add_space(4.0);
                                             ui.horizontal(|ui| {
@@ -3227,6 +3441,22 @@ impl eframe::App for App {
                                                 }
                                             });
                                         }
+                                        #[cfg(not(feature = "enhanced"))]
+                                        if snap.status == Status::Failed {
+                                            ui.add_space(4.0);
+                                            ui.horizontal(|ui| {
+                                                if snap.message.contains("磁盘空间")
+                                                    && ui.button("去设置换目录").clicked()
+                                                {
+                                                    card_action = Some(CardAction::Settings);
+                                                }
+                                                if ui.button("复制错误").clicked() {
+                                                    card_action = Some(CardAction::CopyError(
+                                                        snap.message.clone(),
+                                                    ));
+                                                }
+                                            });
+                                        }
                                     }
                                     if let Some(out) = &snap.output {
                                         ui.label(
@@ -3235,6 +3465,7 @@ impl eframe::App for App {
                                                 .color(MUTED),
                                         );
                                         // 增强版：文件还在沙箱里
+                                        #[cfg(feature = "enhanced")]
                                         if ENHANCED
                                             && snap.status == Status::Done
                                             && out
@@ -3261,6 +3492,7 @@ impl eframe::App for App {
                                         }
                                     }
                                     // 增强版：安全检查结果
+                                    #[cfg(feature = "enhanced")]
                                     if ENHANCED {
                                         if let Some(rep) = &snap.av {
                                             ui.add_space(4.0);
@@ -3350,13 +3582,16 @@ impl eframe::App for App {
                         }
                     });
                 match card_action {
+                    #[cfg(feature = "enhanced")]
                     Some(CardAction::Services) => self.start_services(),
+                    #[cfg(feature = "enhanced")]
                     Some(CardAction::Accounts) => self.page = Page::Accounts,
                     Some(CardAction::Settings) => self.page = Page::Settings,
                     Some(CardAction::CopyError(m)) => {
                         clipboard_set(&m);
                         self.notify("错误信息已复制");
                     }
+                    #[cfg(feature = "enhanced")]
                     Some(CardAction::Quarantine(p)) => {
                         match av::quarantine(&self.root, &p, "用户确认隔离") {
                             Ok(dest) => {
@@ -3371,10 +3606,12 @@ impl eframe::App for App {
                             Err(e) => self.notify(e),
                         }
                     }
+                    #[cfg(feature = "enhanced")]
                     Some(CardAction::AcceptAv(p)) => {
                         self.update_av(&p, |r| r.accepted = true);
                         self.notify("已保留该文件");
                     }
+                    #[cfg(feature = "enhanced")]
                     Some(CardAction::Release(p)) => {
                         match av::release(&p, &self.cfg.dir) {
                             Ok(dest) => {
@@ -3555,9 +3792,10 @@ fn headless_scan() -> i32 {
     }
 }
 
-// ---------------- 基准测试 ----------------
+// ---------------- 基准测试（增强版） ----------------
 
 /// `--bench <url>`：跑下载并输出可对比的指标（每个 run 一行 JSON）
+#[cfg(feature = "enhanced")]
 fn bench() -> i32 {
     let args: Vec<String> = std::env::args().collect();
     let url = match args.get(2) {
@@ -3603,6 +3841,7 @@ fn bench() -> i32 {
     0
 }
 
+#[cfg(feature = "enhanced")]
 fn bench_once(
     url: &str,
     conn: usize,
@@ -3664,6 +3903,7 @@ fn bench_once(
 }
 
 /// `--bench-scan <页面>`：测解析耗时与候选数量
+#[cfg(feature = "enhanced")]
 fn bench_scan() -> i32 {
     let args: Vec<String> = std::env::args().collect();
     let url = match args.get(2) {
@@ -3709,6 +3949,7 @@ fn bench_scan() -> i32 {
 }
 
 /// `--av-scan <文件>`：手动跑一次安全检查（排查误报时用）
+#[cfg(feature = "enhanced")]
 fn av_scan_cmd() -> i32 {
     let args: Vec<String> = std::env::args().collect();
     let path = match args.get(2) {
@@ -3780,12 +4021,6 @@ fn open_path(path: &std::path::Path) -> Result<(), String> {
     shell_exec(path, None)
 }
 
-/// 打开所在文件夹并选中该文件
-fn reveal_path(path: &std::path::Path) -> Result<(), String> {
-    let params = format!("/select,\"{}\"", path.display());
-    shell_exec(std::path::Path::new("explorer.exe"), Some(&params))
-}
-
 fn main() -> eframe::Result {
     setup::install_panic_hook();
     if std::env::args().nth(1).as_deref() == Some("--open") {
@@ -3801,12 +4036,15 @@ fn main() -> eframe::Result {
             }
         }
     }
+    #[cfg(feature = "enhanced")]
     if std::env::args().nth(1).as_deref() == Some("--av-scan") {
         std::process::exit(av_scan_cmd());
     }
+    #[cfg(feature = "enhanced")]
     if std::env::args().nth(1).as_deref() == Some("--bench") {
         std::process::exit(bench());
     }
+    #[cfg(feature = "enhanced")]
     if std::env::args().nth(1).as_deref() == Some("--bench-scan") {
         std::process::exit(bench_scan());
     }
@@ -3816,6 +4054,7 @@ fn main() -> eframe::Result {
     if std::env::args().nth(1).as_deref() == Some("--scan") {
         std::process::exit(headless_scan());
     }
+    #[cfg(feature = "enhanced")]
     if std::env::args().nth(1).as_deref() == Some("--mcp") {
         std::process::exit(mcp::run());
     }

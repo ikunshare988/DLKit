@@ -1,22 +1,22 @@
 [package]
 name = "dlkit"
-version = "0.21.1"
+version = "0.21.2"
 edition = "2021"
 description = "DLKit - 多功能下载器"
 license = "MIT"
 
 [features]
 default = []
-# 增强版：安全扫描、策略配置等能力，轻量版不编译这些分支
-enhanced = []
+# 增强版：安全扫描、策略配置、链接跟踪、托盘等能力；轻量版不编译这些依赖与分支
+enhanced = ["dep:tray-icon", "dep:tauri-winrt-notification"]
 
 [dependencies]
 eframe = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tray-icon = "0.26.1"
-tauri-winrt-notification = "0.7"
+tray-icon = { version = "0.26.1", optional = true }
+tauri-winrt-notification = { version = "0.7", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls", "http2", "charset", "json"] }
 
 [profile.release]

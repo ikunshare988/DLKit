@@ -94,18 +94,22 @@ pub struct Task {
     pub sha256: Option<String>,
     pub output: Option<PathBuf>,
     /// 下载完成后的安全检查结果（增强版）
+    #[cfg(feature = "enhanced")]
     pub av: Option<crate::av::Report>,
     /// 单任务限速（来自策略 profile），None 表示只受全局限速约束
+    #[cfg(feature = "enhanced")]
     pub rate: Option<Arc<TaskRate>>,
     pub started: Instant,
 }
 
 /// 单任务令牌桶：按 profile 的 limit_mbps 卡住这条任务，不影响其他任务
+#[cfg(feature = "enhanced")]
 pub struct TaskRate {
     bps: f64,
     next: Mutex<Instant>,
 }
 
+#[cfg(feature = "enhanced")]
 impl TaskRate {
     pub fn new(mbps: f64) -> TaskRate {
         TaskRate {
@@ -156,7 +160,9 @@ impl Task {
             spawn: None,
             sha256: None,
             output: None,
+            #[cfg(feature = "enhanced")]
             av: None,
+            #[cfg(feature = "enhanced")]
             rate: None,
             started: Instant::now(),
         }
@@ -359,6 +365,7 @@ fn free_space(_dir: &Path) -> Option<u64> {
 }
 
 /// 给环境检查用的公开入口
+#[cfg(feature = "enhanced")]
 pub fn disk_free(dir: &Path) -> Option<u64> {
     free_space(dir)
 }
@@ -687,6 +694,7 @@ pub fn probe(url: &str, headers: &BTreeMap<String, String>) -> Result<Probe, Eng
 /// 链接跟踪只需要响应头：状态码、ETag、Last-Modified、长度、最终地址、文件名。
 /// 和 probe 的区别是不因 4xx 直接报错（404 要单独标记成「失效」），
 /// 也不探测分片能力，尽量把每次轮询的请求压到最小。
+#[cfg(feature = "enhanced")]
 pub struct HeadInfo {
     pub status: u16,
     /// 跟随重定向后的最终地址（去掉 query 后可用来判断 releases/latest 这类链接的版本）
@@ -697,6 +705,7 @@ pub struct HeadInfo {
     pub filename: String,
 }
 
+#[cfg(feature = "enhanced")]
 pub fn head_info(url: &str, headers: &BTreeMap<String, String>) -> Result<HeadInfo, EngErr> {
     let mut args: Vec<String> = [
         "-sS",
@@ -2332,6 +2341,7 @@ struct PoolCtx {
     active: AtomicUsize,
     fails: AtomicUsize,
     head_bytes: Arc<Mutex<Vec<u8>>>,
+    #[cfg(feature = "enhanced")]
     rate: Option<Arc<TaskRate>>,
 }
 
@@ -2482,6 +2492,7 @@ impl PoolCtx {
                             break;
                         }
                         bandwidth().throttle(take as u64);
+                        #[cfg(feature = "enhanced")]
                         if let Some(r) = &self.rate {
                             r.throttle(take as u64);
                         }
@@ -2588,6 +2599,7 @@ pub fn run_pool(
 
     let conn = conn.max(1);
     let extra = ((conn as f64 * 0.25).ceil() as usize).max(1).min(16);
+    #[cfg(feature = "enhanced")]
     let rate = task.lock().ok().and_then(|t| t.rate.clone());
     let client = pool_client(conn + extra)?;
 
@@ -2605,6 +2617,7 @@ pub fn run_pool(
         .ok()
         .and_then(|s| serde_json::from_str::<State>(&s).ok())
         .unwrap_or_default();
+    #[cfg(feature = "enhanced")]
     log_line(
         &task,
         format!(
@@ -2617,6 +2630,11 @@ pub fn run_pool(
                 None => "跟随全局",
             }
         ),
+    );
+    #[cfg(not(feature = "enhanced"))]
+    log_line(
+        &task,
+        format!("目标：{}（{} 路 + {} 备用）", url, conn, extra),
     );
     if !prev.done.is_empty() {
         log_line(
@@ -2718,6 +2736,7 @@ pub fn run_pool(
                 Ok(0) => break,
                 Ok(n) => {
                     bandwidth().throttle(n as u64);
+                    #[cfg(feature = "enhanced")]
                     if let Some(r) = &rate {
                         r.throttle(n as u64);
                     }
@@ -2867,6 +2886,7 @@ pub fn run_pool(
         active: AtomicUsize::new(0),
         fails: AtomicUsize::new(0),
         head_bytes: head_bytes.clone(),
+        #[cfg(feature = "enhanced")]
         rate,
     });
 
@@ -2895,6 +2915,7 @@ pub fn run_pool(
                             break;
                         }
                         bandwidth().throttle(take as u64);
+                        #[cfg(feature = "enhanced")]
                         if let Some(r) = &ctx.rate {
                             r.throttle(take as u64);
                         }
@@ -4241,6 +4262,7 @@ fn run_media(task: Shared, root: &Path, url: &str, dir: &Path, headers: &BTreeMa
         cmd.arg("--user-agent").arg(v);
     }
     // 账号页配置的 B 站登录方式（浏览器 Cookie 或手动粘贴的 Cookie）
+    #[cfg(feature = "enhanced")]
     if headers.get("Cookie").is_none() {
         crate::accounts::Accounts::load(root).apply_media(&mut cmd);
     }
@@ -4466,6 +4488,7 @@ pub fn default_headers() -> BTreeMap<String, String> {
 }
 
 /// 验证 OpenList 地址与账号（账号页「保存并测试」用）
+#[cfg(feature = "enhanced")]
 pub fn openlist_test(root: &Path) -> Result<(), String> {
     let (base, user, pass) = openlist_conf(root);
     let data = ol_post(

@@ -145,6 +145,7 @@ pub fn install_panic_hook() {
 }
 
 /// 找到最近一次崩溃日志（已确认过的会被改名成 .seen）
+#[cfg(feature = "enhanced")]
 pub fn last_crash(root: &Path) -> Option<PathBuf> {
     let dir = root.join("logs");
     let mut best: Option<(SystemTime, PathBuf)> = None;
@@ -164,6 +165,7 @@ pub fn last_crash(root: &Path) -> Option<PathBuf> {
 }
 
 /// 用户点过「知道了」后把日志改名，避免每次启动都提示
+#[cfg(feature = "enhanced")]
 pub fn mark_crash_seen(path: &Path) {
     let seen = path.with_extension("log.seen");
     let _ = fs::rename(path, seen);

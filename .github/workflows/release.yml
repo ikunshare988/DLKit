@@ -15,6 +15,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 每个 tag 必须有对应的版本说明，缺失就直接失败，避免再出现空的 Release
+      - name: 检查版本说明
+        shell: pwsh
+        run: |
+          $f = ".github/release-notes/${{ github.ref_name }}.md"
+          if (-not (Test-Path $f)) { throw "缺少版本说明：$f" }
+          Get-Content $f
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -40,11 +48,82 @@ jobs:
         run: |
           Copy-Item ui\target\release\dlkit.exe dist\DLKit-enhanced.exe
 
+      - name: 打包依赖组合包
+        shell: pwsh
+        run: |
+          # 离线依赖包：解压到程序目录即可用磁力 / 视频站，省去联网一键安装
+          $ProgressPreference = "SilentlyContinue"
+          $tmp = Join-Path $env:RUNNER_TEMP "dlkit-deps"
+          $stage = "dist\pkg\DLKit-deps"
+          New-Item -ItemType Directory -Force $tmp | Out-Null
+          New-Item -ItemType Directory -Force "$stage\bin\aria2", "$stage\bin\yt-dlp", "$stage\bin\ffmpeg\bin" | Out-Null
+
+          Invoke-WebRequest -Uri "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip" -OutFile "$tmp\aria2.zip"
+          Expand-Archive "$tmp\aria2.zip" -DestinationPath "$tmp\aria2" -Force
+          $aria = Get-ChildItem "$tmp\aria2" -Recurse -Filter aria2c.exe | Select-Object -First 1
+          Copy-Item $aria.FullName "$stage\bin\aria2\aria2c.exe"
+
+          Invoke-WebRequest -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" -OutFile "$stage\bin\yt-dlp\yt-dlp.exe"
+
+          # gyan.dev 偶尔很慢，优先用同一作者的 GitHub 发布页，失败再回退官网
+          $ffUrls = @(
+            "https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip",
+            "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          )
+          $ffOk = $false
+          foreach ($u in $ffUrls) {
+            try {
+              Invoke-WebRequest -Uri $u -OutFile "$tmp\ffmpeg.zip" -TimeoutSec 600
+              $ffOk = $true
+              break
+            } catch {
+              Write-Warning "ffmpeg 下载失败，换下一个源：$u"
+            }
+          }
+          if (-not $ffOk) { throw "ffmpeg 下载失败" }
+          Expand-Archive "$tmp\ffmpeg.zip" -DestinationPath "$tmp\ffmpeg" -Force
+          $ffmpeg = Get-ChildItem "$tmp\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          Copy-Item $ffmpeg.FullName "$stage\bin\ffmpeg\bin\ffmpeg.exe"
+          Copy-Item (Join-Path $ffmpeg.Directory.FullName "ffprobe.exe") "$stage\bin\ffmpeg\bin\ffprobe.exe"
+
+          $ariaVer = (& "$stage\bin\aria2\aria2c.exe" --version | Select-Object -First 1)
+          $ytdlpVer = (& "$stage\bin\yt-dlp\yt-dlp.exe" --version)
+          $ffVer = (& "$stage\bin\ffmpeg\bin\ffmpeg.exe" -version | Select-Object -First 1)
+
+          $readme = @"
+          DLKit 依赖包（Windows x64）
+
+          包含：
+            aria2c.exe   BT / 磁力 / aria2 引擎
+            yt-dlp.exe   视频站下载
+            ffmpeg.exe   音视频合并
+            ffprobe.exe  媒体信息探测
+
+          用法：把压缩包里的 bin 文件夹解压到 DLKit.exe 所在目录，合并后为：
+            DLKit.exe
+            bin\aria2\aria2c.exe
+            bin\yt-dlp\yt-dlp.exe
+            bin\ffmpeg\bin\ffmpeg.exe
+            bin\ffmpeg\bin\ffprobe.exe
+
+          增强版也可以在「设置 → 依赖」里联网一键安装，效果相同。
+          OpenList 是自托管的网盘桥接服务，需要单独部署，不在此包中。
+
+          版本：
+            $ariaVer
+            yt-dlp $ytdlpVer
+            $ffVer
+          "@
+          Set-Content -Path "$stage\README-deps.txt" -Value $readme -Encoding utf8
+
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\DLKit-deps-win-x64.zip" -Force
+          Get-Item "dist\DLKit-deps-win-x64.zip" | Select-Object Name, Length
+
       - name: 计算校验值
         shell: pwsh
         run: |
           $lines = @()
-          foreach ($n in @("DLKit.exe", "DLKit-enhanced.exe")) {
+          foreach ($n in @("DLKit.exe", "DLKit-enhanced.exe", "DLKit-deps-win-x64.zip")) {
             $h = (Get-FileHash "dist\$n" -Algorithm SHA256).Hash.ToLower()
             $lines += "$h  $n"
           }
@@ -60,6 +139,7 @@ jobs:
           # 证书里会记录本仓库、本工作流和 tag，任何人都能离线验证签名来源
           cosign sign-blob --yes --bundle dist\DLKit.exe.bundle dist\DLKit.exe
           cosign sign-blob --yes --bundle dist\DLKit-enhanced.exe.bundle dist\DLKit-enhanced.exe
+          cosign sign-blob --yes --bundle dist\DLKit-deps-win-x64.zip.bundle dist\DLKit-deps-win-x64.zip
           Get-ChildItem dist
 
       - name: 创建 Release
@@ -68,7 +148,9 @@ jobs:
           files: |
             dist/DLKit.exe
             dist/DLKit-enhanced.exe
+            dist/DLKit-deps-win-x64.zip
             dist/SHA256.txt
             dist/DLKit.exe.bundle
             dist/DLKit-enhanced.exe.bundle
-          generate_release_notes: true
+            dist/DLKit-deps-win-x64.zip.bundle
+          body_path: .github/release-notes/${{ github.ref_name }}.md

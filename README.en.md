@@ -16,14 +16,15 @@ What it is for:
 
 Get the build you need from [Releases](https://github.com/ikunshare988/DLKit/releases) and unzip it anywhere:
 
-- `DLKit.exe` — Lite, for short downloads and everyday use
-- `DLKit-enhanced.exe` — Enhanced, adding policy configuration, post-download security checks, cloud reputation and sandboxing
+- `DLKit.exe` — Lite: high-speed downloads, page scanning and basic settings only
+- `DLKit-enhanced.exe` — Enhanced, adding tracking, accounts, policy, security checks, tray and auto-update
+- `DLKit-deps-win-x64.zip` — offline dependencies (aria2c / yt-dlp / ffmpeg / ffprobe); unzip into the app folder for torrents and video sites without the online installer. OpenList is self-hosted and not included
 
-Both share the same core (pooled connections, splitting, faster scanning, link tracking); only the enhanced-only capabilities differ — see [Two editions](#two-editions).
+Both share the same download core (pooled connections, byte-level splitting, standby lanes, throughput-weighted source selection, faster scanning); the lite build simply does not compile the enhanced code — see [Two editions](#two-editions).
 
 The exe is not code-signed, so Windows SmartScreen may warn on first launch — choose "More info → Run anyway". Every release ships a `SHA256.txt` you can verify.
 
-Each release also ships `DLKit.exe.bundle` and `DLKit-enhanced.exe.bundle`, keyless Sigstore signatures produced in GitHub Actions. The certificate records this repository, workflow and tag. With [cosign](https://docs.sigstore.dev/cosign/installation/) installed:
+Each release also ships `DLKit.exe.bundle`, `DLKit-enhanced.exe.bundle` and `DLKit-deps-win-x64.zip.bundle`, keyless Sigstore signatures produced in GitHub Actions. The certificate records this repository, workflow and tag. With [cosign](https://docs.sigstore.dev/cosign/installation/) installed:
 
 ```powershell
 cosign verify-blob --bundle DLKit.exe.bundle `
@@ -184,7 +185,7 @@ Copy `config/policy.example.json` to `config/policy.json`; reload it from Settin
 - If Defender is disabled by policy or another AV, the report says the check was incomplete rather than claiming safety
 - Check a single file manually: `DLKit.exe --av-scan "D:\path\file.exe"`
 
-### Link tracking
+### Link tracking (enhanced)
 
 - Any direct link can be tracked: while the app sits in the tray it polls in the background and shows a Windows notification when the file changes
 - Every 2 minutes by default; all entries are checked once whenever the app starts
@@ -219,13 +220,17 @@ One codebase, two builds:
 
 | | Lite (default) | Enhanced (`--features enhanced`) |
 | --- | --- | --- |
-| Direct links / torrents / video sites / cloud drives | yes | yes |
+| Direct links, page scanning | yes | yes |
 | Pooled connections, byte-level splitting, standby lanes | yes | yes |
-| Faster scanning, GitHub API, cache | yes | yes |
-| Throughput-weighted source selection | yes | yes |
-| Link tracking | yes | yes |
+| Faster scanning, GitHub / npm / PyPI APIs, cache | yes | yes |
+| Throughput-weighted source selection, mirror verification | yes | yes |
+| Basic settings (folder / connections / limit / engine) | yes | yes |
+| Torrents / video sites / cloud drives, one-click dependencies | — | yes |
+| Link tracking | — | yes |
+| Accounts (Bilibili cookies / OpenList) | — | yes |
 | Policy (per-host concurrency, budget, time-of-day limits) | — | yes |
 | Post-download security scan (heuristics / signature / Defender / quarantine) | — | yes |
+| Tray, auto-update, diagnostics, MCP server | — | yes |
 
 ```powershell
 cd ui
