@@ -46,6 +46,28 @@ async function handoff(msg) {
   }
 }
 
+// 只告知 DLKit「扩展已加载」，不负责拉起程序，避免打开浏览器就弹下载器
+function hello() {
+  sendNative({ v: 1, action: "hello", source: "chrome", wake: false })
+    .then(() => {
+      chrome.storage.local.set({ lastOkAt: Date.now(), lastError: "" });
+      markOk();
+    })
+    .catch(() => {});
+}
+
+// DLKit 可能在浏览器之后才启动，定时补一次握手，界面才能自动从「未连接」变成「已连接」
+function scheduleHello() {
+  chrome.alarms.create("dlkit-hello", { periodInMinutes: 5 });
+}
+
+chrome.alarms.onAlarm.addListener((a) => {
+  if (a.name === "dlkit-hello") hello();
+});
+
+hello();
+scheduleHello();
+
 function createMenus() {
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({
@@ -71,6 +93,7 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.get(DEFAULTS, (v) => {
     chrome.storage.local.set({ intercept: v.intercept !== false });
   });
+  hello();
 });
 
 chrome.contextMenus.onClicked.addListener((info) => {

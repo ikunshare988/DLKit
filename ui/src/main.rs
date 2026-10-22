@@ -323,11 +323,25 @@ struct App {
     bridge: Option<bridge::Bridge>,
     /// 设置页显示的注册状态（避免每帧都查注册表）
     bridge_status: String,
+    /// 扩展最近一次握手（持久化，用于显示"上次连接"）
+    ext_seen: Option<u64>,
+    /// 本次运行中扩展是否已经握手
+    ext_live: bool,
     /// 新手引导
     show_guide: bool,
     guide_page: usize,
     /// 一键启用后的两步说明
     show_browser_help: bool,
+    /// 自检快照（只在面板展开或点刷新时更新，避免每帧查注册表）
+    bridge_diag: Option<bridge::Diagnostics>,
+    bridge_diag_at: Instant,
+    /// 帮助窗口里的“浏览器是否调用过”状态（1 秒节流）
+    help_at: Instant,
+    help_called: bool,
+    help_tail: Vec<String>,
+    help_ext_ok: bool,
+    /// 待确认「关掉浏览器并自动装载扩展」的浏览器名（None = 没在确认）
+    pending_kill: Option<&'static str>,
     /// 已经安排过安全检查的文件（按路径去重）
     #[cfg(feature = "enhanced")]
     av_scanned: std::collections::HashSet<PathBuf>,
@@ -611,9 +625,18 @@ impl App {
             bridge_rx,
             bridge,
             bridge_status,
+            ext_seen: bridge::extension_seen(),
+            ext_live: false,
             show_guide,
             guide_page: 0,
             show_browser_help: false,
+            bridge_diag: None,
+            bridge_diag_at: Instant::now() - Duration::from_secs(60),
+            help_at: Instant::now() - Duration::from_secs(5),
+            help_called: false,
+            help_tail: Vec::new(),
+            help_ext_ok: false,
+            pending_kill: None,
             #[cfg(feature = "enhanced")]
             av_scanned: std::collections::HashSet::new(),
             #[cfg(feature = "enhanced")]
@@ -2521,6 +2544,15 @@ impl App {
     fn poll_bridge(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.bridge_rx.try_recv() {
             match msg {
+                bridge::Msg::Hello => {
+                    self.ext_seen = bridge::extension_seen();
+                    self.ext_live = true;
+                    self.log_program("浏览器扩展已连接");
+                    if self.show_browser_help {
+                        self.show_browser_help = false;
+                        self.notify("浏览器接管已就绪");
+                    }
+                }
                 bridge::Msg::Show => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -2585,27 +2617,62 @@ impl App {
         let exe = std::env::current_exe().ok();
         let msg = bridge::apply(true, exe.as_deref());
         self.bridge_status = bridge::host_status();
+        self.bridge_diag = None;
         self.log_program(format!("浏览器接管：{}", msg));
         self.notify(msg);
     }
 
-    /// 一键启用：写好注册表和扩展文件，直接打开浏览器扩展页 + 扩展目录
+    /// 一键启用：写好注册表和扩展文件，然后尽量自己把扩展装进浏览器。
+    /// 浏览器没在运行时直接用 --load-extension 启动，用户不用碰扩展页；
+    /// 已经在运行就问一句要不要关掉重开。这一步只完成“能接管”的准备，
+    /// 扩展没加载并握手前不会显示成功。
     fn enable_browser(&mut self) {
         self.install_bridge();
+        if !bridge::extension_ok() {
+            self.log_program("扩展文件写入失败，浏览器无法加载");
+            self.notify("扩展文件没写成功，请看窗口里的提示");
+        }
+        // 目录直接放进剪贴板，文件选择框里 Ctrl+V 就能到
+        clipboard_set(&bridge::extension_dir().display().to_string());
+        self.show_browser_help = true;
+        self.help_at = Instant::now() - Duration::from_secs(5);
         let browsers = bridge::installed_browsers();
-        let mut opened = None;
-        if let Some((name, _)) = browsers.first() {
-            if bridge::open_extensions_page(name).is_ok() {
-                opened = Some(*name);
+        let Some((name, _)) = browsers.first() else {
+            self.log_program("没有找到 Chromium 系浏览器，无法自动装载扩展");
+            self.notify("没找到 Edge/Chrome，请先安装浏览器");
+            return;
+        };
+        // 首选：浏览器没在运行，直接带扩展启动，一步到位
+        if !bridge::is_running(name) {
+            match bridge::launch_with_extension(name) {
+                Ok(msg) => {
+                    self.log_program(format!("{}，等浏览器握手", msg));
+                    self.notify(&format!("已自动装好扩展并打开 {}，稍等会显示已连接", name));
+                    return;
+                }
+                Err(e) => self.log_program(format!("自动装载失败：{}", e)),
             }
+        }
+        // 浏览器在运行：参数会被丢掉，只能打开扩展页走手动加载
+        let mut opened = None;
+        if bridge::open_extensions_page(name).is_ok() {
+            opened = Some(*name);
         }
         if let Err(e) = bridge::open_extension_dir() {
             self.notify(e);
         }
-        self.show_browser_help = true;
         match opened {
-            Some(n) => self.log_program(format!("已打开 {} 扩展页和扩展目录", n)),
-            None => self.log_program("没有可自动打开的浏览器，请手动打开扩展页"),
+            Some(n) => {
+                self.log_program(format!(
+                    "{} 正在运行，已打开扩展页和扩展目录，等扩展加载后握手",
+                    n
+                ));
+                self.notify("已打开扩展页，请按窗口里的步骤加载一次");
+            }
+            None => {
+                self.log_program("没有可自动打开的浏览器，请手动打开扩展页");
+                self.notify("未找到可自动打开的浏览器，请手动打开扩展页");
+            }
         }
     }
 
@@ -2616,30 +2683,197 @@ impl App {
         }
         let browsers = bridge::installed_browsers();
         let dir = bridge::extension_dir().display().to_string();
+        // 每秒看一眼日志：浏览器到底有没有调用到程序
+        if self.help_at.elapsed() > Duration::from_secs(1) {
+            self.help_at = Instant::now();
+            self.help_called = bridge::browser_called();
+            self.help_tail = bridge::host_log_tail(2);
+            self.help_ext_ok = bridge::extension_ok();
+        }
+        let called = self.help_called;
+        let ext_ok = self.help_ext_ok;
+        let last_call = self.help_tail.last().cloned().unwrap_or_default();
         let mut close = false;
         let mut open_dir = false;
+        let mut reinstall = false;
         let mut open_name: Option<&'static str> = None;
-        egui::Window::new("完成浏览器接管")
+        // 自动装载相关：要关掉哪个浏览器 / 要直接装哪个 / 取消确认
+        let mut ask_kill: Option<&'static str> = None;
+        let mut do_kill: Option<&'static str> = None;
+        let mut auto_go: Option<&'static str> = None;
+        let mut cancel_kill = false;
+        egui::Window::new("加载浏览器扩展")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .default_width(560.0)
             .max_width(600.0)
             .show(ctx, |ui| {
+                if self.ext_live {
+                    ui.horizontal(|ui| {
+                        pill(ui, "扩展已连接", SUCCESS, SUCCESS_BG);
+                        ui.label(
+                            RichText::new("浏览器接管已就绪，可以关闭这个窗口")
+                                .size(11.5)
+                                .color(SUCCESS),
+                        );
+                    });
+                    ui.add_space(6.0);
+                } else {
+                    ui.horizontal(|ui| {
+                        pill(ui, "等待扩展连接", MUTED, PANEL);
+                        ui.label(
+                            RichText::new("加载成功后这里会自动变成已连接")
+                                .size(11.5)
+                                .color(MUTED),
+                        );
+                    });
+                    ui.add_space(6.0);
+                }
+                if !ext_ok {
+                    ui.horizontal_wrapped(|ui| {
+                        pill(ui, "扩展文件异常", DANGER, DANGER_BG);
+                        ui.label(
+                            RichText::new("目录里缺少 manifest.json 或写入被拦截，先点「重新注册」")
+                                .size(11.0)
+                                .color(DANGER),
+                        );
+                    });
+                    ui.add_space(6.0);
+                }
                 ui.label(
-                    RichText::new("还差两步，浏览器就能接管下载")
-                        .size(16.0)
+                    RichText::new("推荐：让程序直接装进浏览器")
+                        .size(15.0)
                         .strong()
                         .color(PRIMARY),
                 );
-                ui.add_space(8.0);
-                ui.label(RichText::new("1. 在刚打开的扩展页，打开右上角的「开发者模式」").size(13.0));
-                ui.label(RichText::new("2. 点「加载已解压的扩展」，选择这个目录：").size(13.0));
+                ui.add_space(3.0);
+                match browsers.first().map(|(n, _)| *n) {
+                    None => {
+                        ui.label(
+                            RichText::new("没检测到 Edge / Chrome，装不了，请先装浏览器")
+                                .size(12.0)
+                                .color(DANGER),
+                        );
+                    }
+                    Some(n) => {
+                        let running = bridge::is_running(n);
+                        if let Some(pending) = self.pending_kill {
+                            ui.label(
+                                RichText::new(format!(
+                                    "要装扩展必须先关掉 {}：浏览器在运行时，启动参数会被丢掉。",
+                                    pending
+                                ))
+                                .size(12.0)
+                                .color(TEXT),
+                            );
+                            ui.label(
+                                RichText::new("关掉会一并结束它当前打开的所有标签页。")
+                                    .size(11.0)
+                                    .color(ACCENT),
+                            );
+                            ui.add_space(3.0);
+                            ui.horizontal(|ui| {
+                                let btn = egui::Button::new(
+                                    RichText::new(format!("关闭 {} 并自动装载", pending))
+                                        .size(12.5)
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(PRIMARY)
+                                .corner_radius(CornerRadius::same(12));
+                                if ui.add(btn).clicked() {
+                                    do_kill = Some(pending);
+                                }
+                                if ui.button("取消").clicked() {
+                                    cancel_kill = true;
+                                }
+                            });
+                        } else if running {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} 正在运行。带参数启动的话这个参数会被丢掉，所以要先关掉它。",
+                                    n
+                                ))
+                                .size(12.0)
+                                .color(TEXT),
+                            );
+                            ui.add_space(3.0);
+                            if ui
+                                .button(format!("关闭 {} 并自动装载扩展", n))
+                                .clicked()
+                            {
+                                ask_kill = Some(n);
+                            }
+                        } else {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} 现在没开，可以直接带扩展启动，你不用去扩展页。",
+                                    n
+                                ))
+                                .size(12.0)
+                                .color(TEXT),
+                            );
+                            ui.add_space(3.0);
+                            let btn = egui::Button::new(
+                                RichText::new(format!("自动装进 {}（推荐）", n))
+                                    .size(12.5)
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(PRIMARY)
+                            .corner_radius(CornerRadius::same(12));
+                            if ui.add(btn).clicked() {
+                                auto_go = Some(n);
+                            }
+                        }
+                    }
+                }
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new("或者手动加载（一次就永久生效，重启浏览器也还在）")
+                        .size(13.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.add_space(4.0);
+                ui.label(RichText::new("1. 在扩展页打开右上角的「开发者模式」").size(13.0));
+                ui.label(RichText::new("2. 点「加载已解压的扩展」，选择下面这个目录：").size(13.0));
                 ui.label(
                     RichText::new(&dir)
                         .monospace()
                         .size(12.0)
                         .color(PRIMARY),
+                );
+                ui.label(
+                    RichText::new("选择框里可以按 Ctrl+V 直接粘贴上面的路径，再点「选择文件夹」")
+                        .size(10.5)
+                        .color(MUTED),
+                );
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("诊断：").size(10.5).color(MUTED));
+                    if called {
+                        ui.label(
+                            RichText::new("浏览器已调用到 DLKit")
+                                .size(10.5)
+                                .color(SUCCESS),
+                        );
+                        if !last_call.is_empty() {
+                            ui.label(RichText::new(&last_call).monospace().size(10.0).color(MUTED));
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new("浏览器还没有调用到 DLKit")
+                                .size(10.5)
+                                .color(ACCENT),
+                        );
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "一直显示“没有调用”，说明扩展没加载成功，不是接管注册的问题。报 Manifest file is missing or unreadable 是选到了上一层，要进入 browser-extension 这一层再选。",
+                    )
+                    .size(10.5)
+                    .color(MUTED),
                 );
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
@@ -2649,6 +2883,9 @@ impl App {
                     if ui.button("复制目录").clicked() {
                         clipboard_set(&dir);
                     }
+                    if ui.button("重新注册").clicked() {
+                        reinstall = true;
+                    }
                     for (name, _) in &browsers {
                         if ui.button(format!("打开 {} 扩展页", name)).clicked() {
                             open_name = Some(*name);
@@ -2657,6 +2894,11 @@ impl App {
                 });
                 ui.add_space(4.0);
                 ui.label(
+                    RichText::new("Edge 不允许安装商店外的 crx，只有上面两条路：程序自动装，或开发者模式手动加载。")
+                        .size(10.5)
+                        .color(MUTED),
+                );
+                ui.label(
                     RichText::new("也可以手动打开 chrome://extensions 或 edge://extensions")
                         .size(10.5)
                         .color(MUTED),
@@ -2664,7 +2906,7 @@ impl App {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     let btn = egui::Button::new(
-                        RichText::new("我已完成").size(12.5).color(Color32::WHITE),
+                        RichText::new("关闭").size(12.5).color(Color32::WHITE),
                     )
                     .fill(PRIMARY)
                     .corner_radius(CornerRadius::same(12));
@@ -2673,6 +2915,10 @@ impl App {
                     }
                 });
             });
+        if reinstall {
+            self.install_bridge();
+            self.help_at = Instant::now() - Duration::from_secs(5);
+        }
         if open_dir {
             if let Err(e) = bridge::open_extension_dir() {
                 self.notify(e);
@@ -2682,6 +2928,34 @@ impl App {
             if let Err(e) = bridge::open_extensions_page(n) {
                 self.notify(e);
             }
+        }
+        if cancel_kill {
+            self.pending_kill = None;
+        }
+        if let Some(n) = ask_kill {
+            self.pending_kill = Some(n);
+        }
+        // 关掉浏览器 → 等进程退干净 → 带扩展重新启动（参数只在启动时有效）
+        if let Some(n) = do_kill {
+            self.pending_kill = None;
+            if !bridge::kill(n) {
+                self.log_program(format!("没能结束 {} 的进程", n));
+            }
+            std::thread::sleep(Duration::from_millis(1500));
+            auto_go = Some(n);
+        }
+        if let Some(n) = auto_go {
+            match bridge::launch_with_extension(n) {
+                Ok(msg) => {
+                    self.log_program(format!("{}，等浏览器握手", msg));
+                    self.notify(format!("已自动装好扩展并打开 {}，稍等会显示已连接", n));
+                }
+                Err(e) => {
+                    self.log_program(format!("自动装载失败：{}", e));
+                    self.notify(e);
+                }
+            }
+            self.help_at = Instant::now() - Duration::from_secs(5);
         }
         if close {
             self.show_browser_help = false;
@@ -2694,15 +2968,17 @@ impl App {
             self.bridge_status = bridge::host_status();
         }
         card_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("浏览器接管").strong().size(15.0).color(TEXT));
-                let ok = self.bridge_status.starts_with("已注册");
-                pill(
-                    ui,
-                    &self.bridge_status,
-                    if ok { SUCCESS } else { MUTED },
-                    if ok { SUCCESS_BG } else { PANEL },
-                );
+                // 注册成功只是“接管写好了”，不等于扩展已加载，所以不用成功色
+                pill(ui, &self.bridge_status, SECONDARY, PANEL);
+                if self.ext_live {
+                    pill(ui, "扩展已连接", SUCCESS, SUCCESS_BG);
+                } else if let Some(at) = self.ext_seen {
+                    pill(ui, &format!("上次连接 {}", ago_label(at)), MUTED, PANEL);
+                } else {
+                    pill(ui, "扩展未连接", DANGER, DANGER_BG);
+                }
             });
             ui.add_space(3.0);
             ui.label(
@@ -2735,7 +3011,7 @@ impl App {
                 .corner_radius(CornerRadius::same(12));
                 if ui
                     .add(btn)
-                    .on_hover_text("注册接管并打开浏览器扩展页和扩展目录")
+                    .on_hover_text("注册接管，并尽量直接把扩展装进浏览器")
                     .clicked()
                 {
                     self.enable_browser();
@@ -2753,6 +3029,40 @@ impl App {
                     self.notify("扩展 ID 已复制");
                 }
             });
+            // 浏览器只认「启动时带参数」这一种自动装载方式，用户自己重开浏览器时不会带扩展，
+            // 所以留一个常驻入口，随时能把扩展重新挂进去。
+            if let Some((name, _)) = bridge::installed_browsers().into_iter().next() {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(format!("带扩展打开 {}", name))
+                        .on_hover_text("浏览器自己重开不会带扩展，想恢复接管就点这里")
+                        .clicked()
+                    {
+                        if bridge::is_running(name) {
+                            self.pending_kill = Some(name);
+                            self.show_browser_help = true;
+                            self.help_at = Instant::now() - Duration::from_secs(5);
+                        } else {
+                            match bridge::launch_with_extension(name) {
+                                Ok(msg) => {
+                                    self.log_program(format!("{}，等浏览器握手", msg));
+                                    self.notify(format!("已带扩展打开 {}，稍等会显示已连接", name));
+                                }
+                                Err(e) => {
+                                    self.log_program(format!("自动装载失败：{}", e));
+                                    self.notify(e);
+                                }
+                            }
+                        }
+                    }
+                    ui.label(
+                        RichText::new("浏览器自己重开时不会带扩展，重新装就点这里")
+                            .size(10.5)
+                            .color(MUTED),
+                    );
+                });
+            }
             let names: Vec<&str> = bridge::installed_browsers()
                 .into_iter()
                 .map(|(n, _)| n)
@@ -2764,12 +3074,80 @@ impl App {
             };
             ui.label(
                 RichText::new(format!(
-                    "{}；一键启用会打开扩展页和目录。浏览器要求首次在扩展页确认加载一次（开发者模式 → 加载已解压的扩展）",
+                    "{}。注册只代表接管写好了；扩展装进浏览器并握手后才显示「已连接」，只点一键启用不算完成。",
                     detected
                 ))
                 .size(10.5)
                 .color(MUTED),
             );
+            ui.add_space(4.0);
+            egui::CollapsingHeader::new(RichText::new("自检").size(11.5).color(SECONDARY))
+                .id_salt("bridge-diag")
+                .show(ui, |ui| {
+                    if self.bridge_diag.is_none()
+                        || self.bridge_diag_at.elapsed() > Duration::from_secs(3)
+                    {
+                        self.bridge_diag = Some(bridge::diagnose());
+                        self.bridge_diag_at = Instant::now();
+                    }
+                    let mut refresh = false;
+                    if let Some(d) = self.bridge_diag.as_ref() {
+                        diag_line(
+                            ui,
+                            "注册表",
+                            !d.registered.is_empty(),
+                            &if d.registered.is_empty() {
+                                "未写入，点「一键启用」".to_string()
+                            } else {
+                                d.registered.join(" / ")
+                            },
+                        );
+                        diag_line(
+                            ui,
+                            "接管清单",
+                            d.manifest.is_file(),
+                            &d.manifest.display().to_string(),
+                        );
+                        diag_line(
+                            ui,
+                            "指向程序",
+                            d.target_ok,
+                            &if d.target.is_empty() {
+                                "清单里没有 path".to_string()
+                            } else {
+                                d.target.clone()
+                            },
+                        );
+                        diag_line(
+                            ui,
+                            "扩展文件",
+                            d.ext_ok,
+                            &d.ext_dir.display().to_string(),
+                        );
+                        diag_line(
+                            ui,
+                            "浏览器调用",
+                            d.called,
+                            d.tail.last().map(|s| s.as_str()).unwrap_or("没有记录"),
+                        );
+                        diag_line(
+                            ui,
+                            "上次握手",
+                            d.seen.is_some(),
+                            &match d.seen {
+                                Some(at) => ago_label(at),
+                                None => "从未连接".to_string(),
+                            },
+                        );
+                    }
+                    if ui.button("重新检测").clicked() {
+                        refresh = true;
+                    }
+                    if refresh {
+                        self.bridge_diag = Some(bridge::diagnose());
+                        self.bridge_diag_at = Instant::now();
+                    }
+                });
         });
     }
 
@@ -2794,7 +3172,8 @@ impl App {
             (
                 "浏览器接管",
                 "右键网页链接 / 图片 →「用 DLKit 下载」，浏览器发起的下载也会自动接管。\n\
-                 点下面的「现在启用」，程序会打开扩展页和扩展目录，按提示加载一次即可。",
+                 点「现在启用」后：浏览器没开就直接帮它装上扩展并打开；浏览器正开着会先问你要不要关掉重开。\n\
+                 只有扩展真正连上了才会显示「扩展已连接」，注册成功不等于装好了。",
             ),
         ];
         if ENHANCED {
@@ -3150,6 +3529,24 @@ struct Snap {
     av: Option<av::Report>,
 }
 
+fn ago_label(at: u64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let d = now.saturating_sub(at);
+    if d < 120 {
+        "刚刚".into()
+    } else if d < 3600 {
+        format!("{} 分钟前", d / 60)
+    } else if d < 86_400 {
+        format!("{} 小时前", d / 3600)
+    } else {
+        format!("{} 天前", d / 86_400)
+    }
+}
+
 /// 诊所「补来源页重试」：已有 Referer 就沿用，没有就用链接所在站点首页。
 fn referer_extra(task: &Shared) -> Option<BTreeMap<String, String>> {
     let t = task.lock().ok()?;
@@ -3225,6 +3622,19 @@ fn pill(ui: &mut egui::Ui, text: &str, fg: Color32, bg: Color32) {
         .show(ui, |ui| {
             ui.label(RichText::new(text).size(11.5).color(fg));
         });
+}
+
+/// 自检面板的一行：正常 / 异常 + 说明
+fn diag_line(ui: &mut egui::Ui, label: &str, ok: bool, text: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(label).size(10.5).color(MUTED));
+        ui.label(
+            RichText::new(if ok { "正常" } else { "异常" })
+                .size(10.5)
+                .color(if ok { SUCCESS } else { DANGER }),
+        );
+        ui.label(RichText::new(text).size(10.5).color(TEXT));
+    });
 }
 
 /// 圆角进度条（自绘，贴合 Sakura 的柔和风格）
@@ -4592,8 +5002,13 @@ pub(crate) fn open_path(path: &std::path::Path) -> Result<(), String> {
 
 fn main() -> eframe::Result {
     setup::install_panic_hook();
-    // Chrome / Edge 拉起 native messaging host 时，只走 stdio，不开窗口
-    if std::env::args().nth(1).as_deref() == Some("--native-host") {
+    // Chrome / Edge 拉起 native messaging host 时只传一个扩展来源，不带 --native-host，
+    // 所以两种形式都要识别，并且只走 stdio、不开窗口。
+    let first_arg = std::env::args().nth(1).unwrap_or_default();
+    if first_arg == "--native-host"
+        || first_arg.starts_with("chrome-extension://")
+        || first_arg.starts_with("edge-extension://")
+    {
         std::process::exit(bridge::native_host_main());
     }
     if std::env::args().nth(1).as_deref() == Some("--open") {

@@ -142,7 +142,8 @@ A rule means: when a URL starts with `from`, also try the same URL with that pre
 
 - Right-click a link or image → "Download with DLKit"; right-click a page → "Scan this page with DLKit"
 - Downloads started by the browser are cancelled and handed to DLKit; interception can be turned off in the extension options
-- Settings → Browser takeover → "Enable": writes the registry entry and extension files, then opens the browser's extension page and the extension folder; browsers still require one confirmation (developer mode → load unpacked → `%LOCALAPPDATA%\DLKit\extension`)
+- Settings → Browser takeover → "Enable": writes the registry entry and extension files, then opens the browser's extension page and the extension folder `%USERPROFILE%\Documents\DLKit\browser-extension`; browsers still require one confirmation (developer mode → load unpacked → that folder; you can paste the path with Ctrl+V in the picker)
+- The status is measured: "Extension connected" appears only after the extension is loaded and completes a handshake; clicking Enable alone never reports success, and the built-in self-check shows whether the browser ever called the app
 - Enabled by default; turning it off keeps normal downloads working
 - The local bridge listens on `127.0.0.1` only, validates a random token, and native messaging accepts only the fixed extension ID
 - No cookies are read or synced; only the URL and referrer are passed
