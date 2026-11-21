@@ -1,9 +1,12 @@
 //! 下载页解析：抓取页面 → 提取链接 → 跟随重定向探测 → 输出可下载候选。
 //!
-//! 只做静态 HTML 提取（不执行 JS），覆盖常见下载站：
+//! 静态 HTML 提取（不执行 JS），覆盖常见下载站：
 //! `<a href>`、`<video/audio/source/iframe src>`、`<meta og:video>`、`<link rel=enclosure>`，
 //! 以及内联 JSON / `__NEXT_DATA__` 里的 URL。
 //! 第 0 层是用户给的页面，第 1 层只跟进同源且看起来像下载页的链接。
+//!
+//! 页面用前端框架渲染（`<div id="app">` 空壳、链接由 JS 生成）时，静态提取拿不到东西，
+//! 会退回本机 Edge/Chrome 的无头模式跑一遍 JS，再对渲染后的 DOM 提取。
 
 use crate::engine;
 use reqwest::blocking::Client;
@@ -20,7 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-                  (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+                  (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36";
 const MAX_HTML: usize = 4 << 20;
 const MAX_LEVEL1_PAGES: usize = 8;
 const MAX_CANDIDATES: usize = 120;
@@ -285,6 +288,85 @@ fn fetch_page(url: &str, jar: &Path) -> Result<Page, String> {
         final_url,
         content_type,
     })
+}
+
+/// 页面里是否已经存在明确的文件/媒体链接。没有就值得用无头浏览器渲染一次。
+fn has_file_links(html: &str, base: &str) -> bool {
+    extract_links(html).iter().any(|l| {
+        join_url(base, &l.href)
+            .map(|u| {
+                let e = ext_of(&u);
+                is_file_ext(&e) || is_media_ext(&e)
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// 用本机 Edge/Chrome 的无头模式执行一遍 JS，取回渲染后的 DOM。
+/// `--virtual-time-budget` 让脚本有时间跑完再 dump；进程卡住时强杀，不拖住整个扫描。
+fn render_page(url: &str) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let exe = crate::bridge::installed_browsers()
+        .into_iter()
+        .next()
+        .map(|(_, p)| p)
+        .ok_or_else(|| "没有找到 Edge / Chrome，无法渲染动态页面".to_string())?;
+
+    let profile = std::env::temp_dir().join(format!("dlkit-render-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&profile);
+
+    let mut c = Command::new(&exe);
+    c.arg("--headless=new")
+        .arg("--disable-gpu")
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--disable-extensions")
+        .arg("--mute-audio")
+        .arg("--virtual-time-budget=8000")
+        .arg("--dump-dom")
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000);
+    }
+
+    let mut child = c.spawn().map_err(|e| format!("启动无头浏览器失败：{}", e))?;
+    let out = child.stdout.take().ok_or_else(|| "拿不到渲染输出".to_string())?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out.take(MAX_HTML as u64).read_to_end(&mut buf);
+        let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(150));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&profile);
+
+    match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(s) if !s.trim().is_empty() => Ok(s),
+        Ok(_) => Err("无头浏览器没有输出".into()),
+        Err(_) => Err("读取渲染结果超时".into()),
+    }
 }
 
 fn decode_body(bytes: &[u8], content_type: &str) -> String {
@@ -627,21 +709,59 @@ fn package_files(page_url: &str) -> Option<Vec<(String, String, Option<String>)>
     None
 }
 
+/// 媒体域名下也可能挂着「下载页」（客户端/安装包）。命中这些词就按普通页面解析，
+/// 不要直接当成单个视频交给 yt-dlp。
+fn looks_like_download_page(url: &str) -> bool {
+    let low = url.to_lowercase();
+    [
+        "download", "client", "install", "update", "setup", "pc.html", "pc.php",
+    ]
+    .iter()
+    .any(|k| low.contains(k))
+}
+
+/// 交给 yt-dlp 的单条媒体候选
+fn media_candidate(page_url: &str) -> Candidate {
+    Candidate {
+        title: format!("媒体链接 {}", engine::url_host(page_url).unwrap_or_default()),
+        page: page_url.to_string(),
+        url: page_url.to_string(),
+        size: 0,
+        kind: CandKind::Media,
+        type_label: "视频".into(),
+        note: "交给 yt-dlp 解析格式".into(),
+        checked: true,
+        order: 0,
+        sha256: None,
+    }
+}
+
+/// 识别 Cloudflare / WAF 的拦截页。命中时不该报「没找到文件」，
+/// 而要告诉用户去浏览器里过验证——那是唯一能过的路径。
+fn blocked_hint(html: &str) -> Option<String> {
+    let low = html.to_lowercase();
+    let hit = low.contains("cf-error-details")
+        || low.contains("attention required")
+        || low.contains("you have been blocked")
+        || low.contains("cf-mitigated")
+        || low.contains("challenges.cloudflare.com");
+    if !hit {
+        return None;
+    }
+    Some(
+        "该站拦截了程序访问（Cloudflare 人机验证），程序无法直连。\n\
+         处理办法：在浏览器里打开这个页面，等验证通过后点页面上的下载按钮，\
+         DLKit 会自动接管这次下载。"
+            .into(),
+    )
+}
+
 fn scan(shared: &ScanShared, page_url: &str, jar: &Path) -> Result<Vec<Candidate>, String> {
-    // 媒体站（B站/YouTube…）交给 yt-dlp，不必解析页面
-    if engine::classify(page_url).0 == engine::Kind::Media {
-        return Ok(vec![Candidate {
-            title: format!("媒体链接 {}", engine::url_host(page_url).unwrap_or_default()),
-            page: page_url.to_string(),
-            url: page_url.to_string(),
-            size: 0,
-            kind: CandKind::Media,
-            type_label: "视频".into(),
-            note: "交给 yt-dlp 解析格式".into(),
-            checked: true,
-            order: 0,
-            sha256: None,
-        }]);
+    // 媒体站（B站/YouTube…）通常是单个视频，交给 yt-dlp 最省事。
+    // 但同一个域名下也可能挂着「下载页」（例如 y.qq.com 的客户端下载页），
+    // 一律当视频会错标成「视频资源」并且必然失败。所以只有路径不像下载页时才走捷径。
+    if engine::classify(page_url).0 == engine::Kind::Media && !looks_like_download_page(page_url) {
+        return Ok(vec![media_candidate(page_url)]);
     }
 
     let host0 = engine::url_host(page_url).unwrap_or_default();
@@ -676,6 +796,8 @@ fn scan(shared: &ScanShared, page_url: &str, jar: &Path) -> Result<Vec<Candidate
     let mut level1: Vec<String> = vec![page_url.to_string()];
     let mut seen_pages: HashSet<String> = HashSet::new();
     let mut raw: Vec<Raw> = Vec::new();
+    // 无头渲染一次要几秒，整个扫描预算只有 45s，最多渲染 2 次
+    let mut renders = 0usize;
 
     for depth in 0..2 {
         let mut next: Vec<String> = Vec::new();
@@ -697,6 +819,12 @@ fn scan(shared: &ScanShared, page_url: &str, jar: &Path) -> Result<Vec<Candidate
                     continue;
                 }
             };
+            // 被 Cloudflare 之类拦下时，直接说清楚怎么绕过，别报“没找到文件”
+            if depth == 0 {
+                if let Some(h) = blocked_hint(&page.html) {
+                    return Err(h);
+                }
+            }
             if let Ok(mut st) = shared.lock() {
                 st.pages_done += 1;
             }
@@ -720,7 +848,30 @@ fn scan(shared: &ScanShared, page_url: &str, jar: &Path) -> Result<Vec<Candidate
                 continue;
             }
 
-            for link in extract_links(&page.html) {
+            // 前端框架渲染的页面（<div id="app"> 空壳）：静态 HTML 里没有文件链接时，
+            // 用本机浏览器的无头模式执行一遍 JS，再对渲染后的 DOM 提取。
+            let mut html = page.html.clone();
+            if !has_file_links(&html, &page.final_url)
+                && renders < 2
+                && deadline.saturating_duration_since(Instant::now()) > Duration::from_secs(25)
+                && !cancelled(shared)
+            {
+                renders += 1;
+                set_msg(
+                    shared,
+                    format!("页面由 JS 生成，正在用浏览器渲染：{}", short_url(&url)),
+                );
+                if let Ok(rendered) = render_page(&page.final_url) {
+                    if let Some(h) = blocked_hint(&rendered) {
+                        return Err(h);
+                    }
+                    if has_file_links(&rendered, &page.final_url) {
+                        html = rendered;
+                    }
+                }
+            }
+
+            for link in extract_links(&html) {
                 let abs = match join_url(&page.final_url, &link.href) {
                     Some(u) => u,
                     None => continue,

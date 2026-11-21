@@ -53,12 +53,16 @@ function hello() {
       chrome.storage.local.set({ lastOkAt: Date.now(), lastError: "" });
       markOk();
     })
-    .catch(() => {});
+    .catch(() => {
+      // DLKit 没开不是错误，别挂红色感叹号吓人
+      badge("", null);
+      chrome.action.setTitle({ title: "DLKit 浏览器接管（程序未运行）" });
+    });
 }
 
 // DLKit 可能在浏览器之后才启动，定时补一次握手，界面才能自动从「未连接」变成「已连接」
 function scheduleHello() {
-  chrome.alarms.create("dlkit-hello", { periodInMinutes: 5 });
+  chrome.alarms.create("dlkit-hello", { periodInMinutes: 1 });
 }
 
 chrome.alarms.onAlarm.addListener((a) => {

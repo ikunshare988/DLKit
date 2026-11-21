@@ -475,6 +475,53 @@ fn reg(args: &[&str]) -> bool {
     c.status().map(|s| s.success()).unwrap_or(false)
 }
 
+/// 读 reg 命令输出（查版本用）
+fn reg_out(args: &[&str]) -> Option<String> {
+    let mut c = std::process::Command::new("reg.exe");
+    c.args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000);
+    }
+    let o = c.output().ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&o.stdout).to_string())
+}
+
+/// 浏览器主版本号。Chrome/Edge/Brave 都会把版本写进 BLBeacon，查注册表比解析 exe 稳。
+pub fn browser_major(name: &str) -> Option<u32> {
+    let key = match name {
+        "Chrome" => r"HKCU\Software\Google\Chrome\BLBeacon",
+        "Edge" => r"HKCU\Software\Microsoft\Edge\BLBeacon",
+        "Brave" => r"HKCU\Software\BraveSoftware\Brave-Browser\BLBeacon",
+        _ => return None,
+    };
+    let out = reg_out(&["query", key, "/v", "version"])?;
+    let ver = out
+        .lines()
+        .find(|l| l.contains("version"))
+        .and_then(|l| l.split_whitespace().last())
+        .map(|v| v.to_string())?;
+    ver.split('.').next()?.parse().ok()
+}
+
+/// Chrome 137 起从正式版移除了 `--load-extension`（防止恶意扩展静默安装），
+/// 只有 Chromium / Chrome for Testing 还认这个参数。版本 >= 137 一律走手动加载。
+pub fn load_extension_supported(name: &str) -> bool {
+    if name == "Chromium" {
+        return true;
+    }
+    match browser_major(name) {
+        Some(v) => v < 137,
+        None => false,
+    }
+}
+
 fn host_manifest_path() -> PathBuf {
     app_dir().join("native-host").join(format!("{}.json", HOST_NAME))
 }
@@ -758,12 +805,52 @@ pub fn open_extension_dir() -> Result<(), String> {
     crate::open_path(&extension_dir())
 }
 
+/// 打开资源管理器并直接选中 manifest.json。
+/// 「加载已解压的扩展」最常见的失败是选到了上一层目录（DLKit 而不是 browser-extension），
+/// 这样打开能少踩一次坑。
+pub fn reveal_extension_dir() -> Result<(), String> {
+    write_extension_files()?;
+    let manifest = extension_dir().join("manifest.json");
+    std::process::Command::new("explorer.exe")
+        .arg(format!("/select,{}", manifest.display()))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开目录失败：{}", e))
+}
+
+/// 启动自愈：程序被移动/重命名后，清单里还留着旧 exe 路径，
+/// native messaging 就再也拉不起宿主，表现为「扩展装了但一直未连接」。
+/// 这里在每次启动时对比路径，不一致就重写清单并补注册表。
+pub fn self_heal(exe: &Path) -> String {
+    let registered_path = std::fs::read_to_string(host_manifest_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            v.get("path")
+                .and_then(|p| p.as_str())
+                .map(|p| p.to_string())
+        });
+    let stale = match &registered_path {
+        Some(p) => Path::new(p) != exe || !Path::new(p).is_file(),
+        None => true,
+    };
+    if !stale && !registered_names().is_empty() {
+        // 清单和注册表都对，只补扩展文件，不反复写注册表
+        let _ = write_extension_files();
+        return host_status();
+    }
+    match install_native_host(exe) {
+        Ok(s) => s,
+        Err(e) => format!("自愈失败：{}", e),
+    }
+}
+
 // ---------- 直接用命令行把扩展挂进浏览器启动 ----------
 //
-// Edge/Chrome 都认 `--load-extension=目录`：带这个参数启动时，浏览器会直接加载该扩展，
-// 不需要开开发者模式，也不需要手动「加载已解压的扩展」，绕开了「外来插件装不进 Edge」。
-// 唯一的限制是浏览器已经在运行时，Chromium 会把参数丢掉（只把地址转给已有实例），
-// 所以调用前必须先确认浏览器没有在运行。
+// 历史做法：带 `--load-extension=目录` 启动，浏览器会直接加载该扩展。
+// 但 Chrome 137（2025-05）以安全为由从正式版移除了这个参数，Edge 随后同步，
+// 现在的 Chrome/Edge 会正常打开、静默忽略参数 —— 用户以为装上了，其实没有。
+// 因此该方式只保留给 Chromium / 137 之前的旧版本，其余一律走手动「加载已解压的扩展」。
 
 fn exe_name(exe: &Path) -> String {
     exe.file_name()
@@ -823,8 +910,19 @@ pub fn kill(name: &str) -> bool {
 }
 
 /// 用带扩展的方式启动浏览器。要求浏览器当前没有在运行。
+/// 注意：Chrome/Edge 137 之后已经不吃 `--load-extension` 了，这里会直接拒绝，
+/// 免得浏览器正常打开、扩展却没加载，用户以为装好了。
 pub fn launch_with_extension(name: &str) -> Result<String, String> {
     let exe = browser_exe(name).ok_or_else(|| format!("没有找到 {}", name))?;
+    if !load_extension_supported(name) {
+        let ver = browser_major(name)
+            .map(|v| format!("{} ", v))
+            .unwrap_or_default();
+        return Err(format!(
+            "{} {}已不支持命令行装扩展，只能手动加载一次（见下面的步骤）",
+            name, ver
+        ));
+    }
     write_extension_files()?;
     if is_running(name) {
         return Err(format!("{} 正在运行，参数会被丢掉", name));

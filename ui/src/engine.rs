@@ -19,7 +19,11 @@ use reqwest::header::{ACCEPT_ENCODING, CONTENT_DISPOSITION, CONTENT_LENGTH, CONT
 use std::os::windows::fs::FileExt;
 
 pub const DEFAULT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-                             (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+                             (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36";
+/// 浏览器导航时的默认 Accept。末尾的 `*/*;q=0.8` 保证直链下载不会被内容协商成网页。
+pub const ACCEPT_HTML: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,\
+                               image/avif,image/webp,*/*;q=0.8";
+pub const ACCEPT_LANG: &str = "zh-CN,zh;q=0.9,en;q=0.8";
 const MIN_CHUNK: u64 = 512 * 1024;
 
 /// 同一进程内的任务序号：用于给临时请求头文件取唯一名字，
@@ -553,7 +557,7 @@ fn status_text(code: u16) -> String {
     match code {
         400 => "请求无效（HTTP 400）".into(),
         401 => "需要登录或授权（HTTP 401），请填写 Cookie".into(),
-        403 => "请求被拒绝（HTTP 403）：可能需要 Cookie/Referer，或该站禁止直接下载".into(),
+        403 => "请求被拒绝（HTTP 403）：可能需要 Cookie/Referer；若在浏览器里打开会要求人机验证，请先在浏览器完成验证再点「继续」".into(),
         404 => "链接失效或文件不存在（HTTP 404）".into(),
         410 => "文件已被删除（HTTP 410）".into(),
         429 => "请求过于频繁被限流（HTTP 429）".into(),
@@ -562,6 +566,63 @@ fn status_text(code: u16) -> String {
         503 => "服务暂不可用（HTTP 503）".into(),
         504 => "网关超时（HTTP 504）".into(),
         _ => format!("HTTP {}", code),
+    }
+}
+
+/// 验证/拦截页的可执行指引。不做自动绕过，只告诉用户下一步该做什么。
+fn challenge_text(status: u16) -> String {
+    format!(
+        "这个链接要求人机验证（HTTP {}），程序不能代替你通过。\n\
+         处理办法：\n\
+         1. 在浏览器里打开该链接，正常完成验证（Cloudflare 的「请稍候」或图形验证）；\n\
+         2. 验证通过、页面能正常显示或开始下载后，回到 DLKit 点「继续」重试；\n\
+         3. 若仍失败，在浏览器里复制该站点的 Cookie，填到任务的请求头里再试。\n\
+         提示：短时间内反复重试会让风控更严格，先完成验证再重试。",
+        status
+    )
+}
+
+/// 判断响应头是不是人机验证/风控拦截页。
+/// 命中后应立即失败并给指引，而不是像普通 403 一样重试——重试只会加深拦截。
+fn challenge_hint(status: u16, h: &BTreeMap<String, String>) -> Option<String> {
+    let low = |k: &str| {
+        h.get(k)
+            .map(|v| v.to_lowercase())
+            .unwrap_or_default()
+    };
+    let mitigated = low("cf-mitigated");
+    let server = low("server");
+    let ctype = low("content-type");
+    let vercel = low("x-vercel-mitigated");
+    let challenged = mitigated.contains("challenge")
+        || vercel.contains("challenge")
+        || (server.contains("cloudflare") && matches!(status, 403 | 429 | 503))
+        || (matches!(status, 403 | 429 | 503) && ctype.starts_with("text/html"));
+    if challenged {
+        Some(challenge_text(status))
+    } else {
+        None
+    }
+}
+
+/// 同上，但直接读 reqwest 的响应头（分片下载路径用）
+fn challenge_hint_resp(r: &reqwest::blocking::Response) -> Option<String> {
+    let status = r.status().as_u16();
+    let get = |k: &str| {
+        r.headers()
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase()
+    };
+    let challenged = get("cf-mitigated").contains("challenge")
+        || get("x-vercel-mitigated").contains("challenge")
+        || (get("server").contains("cloudflare") && matches!(status, 403 | 429 | 503))
+        || (matches!(status, 403 | 429 | 503) && get("content-type").starts_with("text/html"));
+    if challenged {
+        Some(challenge_text(status))
+    } else {
+        None
     }
 }
 
@@ -613,6 +674,9 @@ pub fn probe(url: &str, headers: &BTreeMap<String, String>) -> Result<Probe, Eng
         let (st2, h2) = parse_response(&o2);
         if let Some(code) = st2 {
             if code >= 400 {
+                if let Some(hint) = challenge_hint(code, &h2) {
+                    return Err(EngErr::Fatal(hint));
+                }
                 if code == 429 {
                     return Err(EngErr::Soft(status_text(code)));
                 }
@@ -2440,6 +2504,11 @@ impl PoolCtx {
                     }
                     if code == 403 || code == 429 || code >= 500 {
                         self.sources.end(src_idx);
+                        // 人机验证/风控页不重试，直接给出指引
+                        if let Some(hint) = challenge_hint_resp(&r) {
+                            self.fail(hint);
+                            return false;
+                        }
                         if src_idx > 0 {
                             self.sources.mark_bad(src_idx);
                         }
@@ -3260,8 +3329,12 @@ pub fn run_turbo(
     let block = ((size + lanes - 1) / lanes)
         .clamp(4 << 20, 32 << 20)
         .min(size.max(1));
-    let total_blocks = ((size + block - 1) / block) as usize;
-    let workers = conn.max(1).min(total_blocks).max(1);
+    // 收尾细分：最后一段切成 512KB 的小块。
+    // 只用大块时，最后往往只剩一条连接在跑，遇到按连接限速的镜像会塌到零点几 MB/s；
+    // 尾部分成很多小块，可以让所有连接一直忙到最后一字节。
+    const TAIL_BLOCK: u64 = 512 * 1024;
+    let tail_len = (conn.max(1) as u64 * TAIL_BLOCK * 2).min(size);
+    let tail_start = size - tail_len;
 
     let state_path = out_dir.join(format!("{}.dlkit.json", out_name));
     #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -3293,30 +3366,42 @@ pub fn run_turbo(
 
     let done: Arc<Mutex<BTreeSet<u64>>> =
         Arc::new(Mutex::new(prev.done.iter().copied().collect()));
-    let queue: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let queue: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut base_done = 0u64;
     {
         let d = done.lock().unwrap();
         let mut q = queue.lock().unwrap();
+        // 主段：大块，保证吞吐
         let mut off = 0u64;
-        while off < size {
-            if !d.contains(&off) {
-                q.push(off);
+        while off < tail_start {
+            let end = (off + block).min(tail_start) - 1;
+            if d.contains(&off) {
+                base_done += end - off + 1;
+            } else {
+                q.push((off, end));
             }
             off += block;
         }
+        // 尾段：小块，保证收尾时并发不掉
+        let mut t = tail_start;
+        while t < size {
+            let end = (t + TAIL_BLOCK).min(size) - 1;
+            if d.contains(&t) {
+                base_done += end - t + 1;
+            } else {
+                q.push((t, end));
+            }
+            t += TAIL_BLOCK;
+        }
     }
-    if queue.lock().unwrap().is_empty() {
+    let total_blocks = queue.lock().unwrap().len();
+    if total_blocks == 0 {
         set_progress(&task, size, size, 0.0);
         let _ = fs::remove_file(&state_path);
         return Ok(out_path);
     }
+    let workers = conn.max(1).min(total_blocks).max(1);
 
-    let base_done: u64 = done
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|&o| (size - o).min(block))
-        .sum();
     let counter = Arc::new(AtomicU64::new(base_done));
     let io = Arc::new(IoStats::default());
     let limiter = Arc::new(Limiter::new(workers));
@@ -3335,10 +3420,11 @@ pub fn run_turbo(
     log_line(
         &task,
         format!(
-            "探测 {:.2}s，{} 块 × {:.1} MB",
+            "探测 {:.2}s，{} 块（主段 {:.1} MB，尾段 {} KB 细分）",
             pr.probe_ms as f64 / 1000.0,
             total_blocks,
-            block as f64 / 1048576.0
+            block as f64 / 1048576.0,
+            TAIL_BLOCK / 1024
         ),
     );
 
@@ -3366,11 +3452,10 @@ pub fn run_turbo(
                 {
                     break;
                 }
-                let off = match queue.lock().unwrap().pop() {
-                    Some(o) => o,
+                let (off, end) = match queue.lock().unwrap().pop() {
+                    Some(r) => r,
                     None => break,
                 };
-                let end = (off + block - 1).min(size - 1);
                 let lane = (off / block) as usize;
                 let ok = fetch_block(
                     &sources, lane, &headers, &file, off, end, &hdr, &counter, &io_stats, &limiter,
@@ -3383,7 +3468,7 @@ pub fn run_turbo(
                     && fatal.lock().unwrap().is_none()
                 {
                     // 该块没成功但未判死：放回队尾，换个时间点再抢
-                    queue.lock().unwrap().push(off);
+                    queue.lock().unwrap().push((off, end));
                     thread::sleep(Duration::from_millis(700));
                 }
             }
@@ -3492,7 +3577,13 @@ pub fn run_turbo(
     set_progress(&task, size, size, 0.0);
     log_line(
         &task,
-        format!("{} 块 × {:.1} MB，{} 路并发完成", total_blocks, block as f64 / 1048576.0, workers),
+        format!(
+            "{} 块（主段 {:.1} MB / 尾段 {} KB），{} 路并发完成",
+            total_blocks,
+            block as f64 / 1048576.0,
+            TAIL_BLOCK / 1024,
+            workers
+        ),
     );
     Ok(out_path)
 }
@@ -4487,6 +4578,10 @@ fn run_openlist(task: Shared, root: &Path, url: &str, dir: &Path, conn: usize, u
 pub fn default_headers() -> BTreeMap<String, String> {
     let mut h = BTreeMap::new();
     h.insert("User-Agent".into(), DEFAULT_UA.into());
+    // 浏览器导航必带的两个头。只给 UA、不给 Accept/Accept-Language 时，
+    // 部分 WAF（Cloudflare / Akamai）会直接判定为脚本并弹人机验证。
+    h.insert("Accept".into(), ACCEPT_HTML.into());
+    h.insert("Accept-Language".into(), ACCEPT_LANG.into());
     h
 }
 
@@ -4778,6 +4873,9 @@ pub fn cancel_task(task: &Shared) {
             t.speed = 0.0;
             t.net_speed = 0.0;
             t.disk_speed = 0.0;
+        } else if t.status == Status::Running {
+            // 正在跑的线程要等到下一次检查才会停，先给个即时反馈
+            t.message = "正在取消…".into();
         }
     }
 }

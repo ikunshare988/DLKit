@@ -446,7 +446,10 @@ impl App {
         let bridge_port = bridge.as_ref().map(|b| b.port);
         let bridge_msg = if cfg.browser {
             let exe = std::env::current_exe().ok();
-            bridge::apply(true, exe.as_deref())
+            match exe.as_deref() {
+                Some(p) => bridge::self_heal(p),
+                None => "拿不到程序路径".to_string(),
+            }
         } else {
             "已关闭".to_string()
         };
@@ -2181,7 +2184,9 @@ impl App {
             self.tasks.push(t);
         }
         self.selected = self.tasks.len().saturating_sub(n);
-        self.scan_hint_hidden = true;
+        // 开始下载后整个解析面板收起，否则候选列表会一直占着上面的空间，
+        // 非全屏时把下面的下载任务列表挤到看不见。
+        self.scan = None;
         self.notify(format!("已加入 {} 个下载任务", n));
     }
 
@@ -2338,9 +2343,12 @@ impl App {
                 }
             });
             ui.add_space(4.0);
+            // 列表高度跟随窗口：非全屏时不要让候选列表把任务列表挤没
+            let win_h = ui.ctx().content_rect().height();
+            let list_h = (win_h * 0.28).clamp(110.0, 250.0);
             egui::ScrollArea::vertical()
                 .id_salt("scan-list")
-                .max_height(250.0)
+                .max_height(list_h)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for (i, c) in candidates.iter().enumerate() {
@@ -2642,8 +2650,8 @@ impl App {
             self.notify("没找到 Edge/Chrome，请先安装浏览器");
             return;
         };
-        // 首选：浏览器没在运行，直接带扩展启动，一步到位
-        if !bridge::is_running(name) {
+        // 首选：浏览器支持命令行装载（Chromium / 137 之前的版本）且没在运行
+        if bridge::load_extension_supported(name) && !bridge::is_running(name) {
             match bridge::launch_with_extension(name) {
                 Ok(msg) => {
                     self.log_program(format!("{}，等浏览器握手", msg));
@@ -2653,21 +2661,21 @@ impl App {
                 Err(e) => self.log_program(format!("自动装载失败：{}", e)),
             }
         }
-        // 浏览器在运行：参数会被丢掉，只能打开扩展页走手动加载
+        // 其余情况：打开扩展页 + 在资源管理器里选中 manifest.json
         let mut opened = None;
         if bridge::open_extensions_page(name).is_ok() {
             opened = Some(*name);
         }
-        if let Err(e) = bridge::open_extension_dir() {
+        if let Err(e) = bridge::reveal_extension_dir() {
             self.notify(e);
         }
         match opened {
             Some(n) => {
                 self.log_program(format!(
-                    "{} 正在运行，已打开扩展页和扩展目录，等扩展加载后握手",
+                    "{} 需要手动加载一次扩展：已打开扩展页和扩展目录",
                     n
                 ));
-                self.notify("已打开扩展页，请按窗口里的步骤加载一次");
+                self.notify("已打开扩展页，按窗口里的三步加载一次即可");
             }
             None => {
                 self.log_program("没有可自动打开的浏览器，请手动打开扩展页");
@@ -2695,6 +2703,7 @@ impl App {
         let last_call = self.help_tail.last().cloned().unwrap_or_default();
         let mut close = false;
         let mut open_dir = false;
+        let mut reveal = false;
         let mut reinstall = false;
         let mut open_name: Option<&'static str> = None;
         // 自动装载相关：要关掉哪个浏览器 / 要直接装哪个 / 取消确认
@@ -2741,11 +2750,19 @@ impl App {
                     });
                     ui.add_space(6.0);
                 }
+                let auto_ok = browsers
+                    .first()
+                    .map(|(n, _)| bridge::load_extension_supported(n))
+                    .unwrap_or(false);
                 ui.label(
-                    RichText::new("推荐：让程序直接装进浏览器")
-                        .size(15.0)
-                        .strong()
-                        .color(PRIMARY),
+                    RichText::new(if auto_ok {
+                        "推荐：让程序直接装进浏览器"
+                    } else {
+                        "当前浏览器只能手动加载（一次即可）"
+                    })
+                    .size(15.0)
+                    .strong()
+                    .color(PRIMARY),
                 );
                 ui.add_space(3.0);
                 match browsers.first().map(|(n, _)| *n) {
@@ -2754,6 +2771,25 @@ impl App {
                             RichText::new("没检测到 Edge / Chrome，装不了，请先装浏览器")
                                 .size(12.0)
                                 .color(DANGER),
+                        );
+                    }
+                    Some(n) if !bridge::load_extension_supported(n) => {
+                        let ver = bridge::browser_major(n)
+                            .map(|v| format!("{} {}", n, v))
+                            .unwrap_or_else(|| n.to_string());
+                        ui.label(
+                            RichText::new(format!(
+                                "{} 已移除命令行装扩展（Chrome 137 起的安全改动），程序没法替你装，只能按下面手动加载一次。",
+                                ver
+                            ))
+                            .size(12.0)
+                            .color(ACCENT),
+                        );
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new("只需要一次，之后每次开浏览器都还在。")
+                                .size(11.0)
+                                .color(MUTED),
                         );
                     }
                     Some(n) => {
@@ -2835,8 +2871,9 @@ impl App {
                         .color(TEXT),
                 );
                 ui.add_space(4.0);
-                ui.label(RichText::new("1. 在扩展页打开右上角的「开发者模式」").size(13.0));
-                ui.label(RichText::new("2. 点「加载已解压的扩展」，选择下面这个目录：").size(13.0));
+                ui.label(RichText::new("1. 在扩展页右上角打开「开发者模式」").size(13.0));
+                ui.label(RichText::new("2. 点「加载已解压的扩展」").size(13.0));
+                ui.label(RichText::new("3. 选择下面这个目录（要进到 browser-extension 这一层）：").size(13.0));
                 ui.label(
                     RichText::new(&dir)
                         .monospace()
@@ -2844,9 +2881,14 @@ impl App {
                         .color(PRIMARY),
                 );
                 ui.label(
-                    RichText::new("选择框里可以按 Ctrl+V 直接粘贴上面的路径，再点「选择文件夹」")
+                    RichText::new("选择框里可以按 Ctrl+V 粘贴上面的路径；或者点下面「在文件夹中选中」，再点「选择文件夹」")
                         .size(10.5)
                         .color(MUTED),
+                );
+                ui.label(
+                    RichText::new("4. 加载成功后这里会变成「扩展已连接」，扩展就会永久留在浏览器里")
+                        .size(10.5)
+                        .color(SUCCESS),
                 );
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
@@ -2877,6 +2919,9 @@ impl App {
                 );
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
+                    if ui.button("在文件夹中选中").clicked() {
+                        reveal = true;
+                    }
                     if ui.button("打开扩展目录").clicked() {
                         open_dir = true;
                     }
@@ -2894,7 +2939,7 @@ impl App {
                 });
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new("Edge 不允许安装商店外的 crx，只有上面两条路：程序自动装，或开发者模式手动加载。")
+                    RichText::new("商店外的扩展只能用开发者模式加载；上架扩展商店后，用户点「添加」就行，不需要这一步。")
                         .size(10.5)
                         .color(MUTED),
                 );
@@ -2921,6 +2966,11 @@ impl App {
         }
         if open_dir {
             if let Err(e) = bridge::open_extension_dir() {
+                self.notify(e);
+            }
+        }
+        if reveal {
+            if let Err(e) = bridge::reveal_extension_dir() {
                 self.notify(e);
             }
         }
@@ -4173,13 +4223,18 @@ impl eframe::App for App {
                                             Status::Failed => ("失败", DANGER, DANGER_BG),
                                             Status::Cancelled => ("已取消", MUTED, PANEL),
                                         };
-                                        let name = ui.add(
+                                        let name = ui.add_sized(
+                                            [
+                                                (ui.available_width() - 300.0).max(90.0),
+                                                ui.spacing().interact_size.y,
+                                            ],
                                             egui::Label::new(
                                                 RichText::new(&snap.name)
                                                     .strong()
                                                     .size(14.5)
                                                     .color(TEXT),
                                             )
+                                            .truncate()
                                             .sense(egui::Sense::click()),
                                         );
                                         if name.double_clicked() && snap.status == Status::Done {
